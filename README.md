@@ -1,4 +1,4 @@
-# 🦅 Angry Birb - Clash of Clans Leaderboard Bot
+# Clash of Clans Leaderboard Bot
 
 The ultimate Discord bot that tracks your Clash of Clans clan members, monitors real-time trophy pushes, and generates interactive server leaderboards.
 
