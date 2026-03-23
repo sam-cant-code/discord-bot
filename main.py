@@ -135,10 +135,6 @@ def get_delta_str(tag, current_trophies, cache):
     return ""
 
 def normalize_league_name(league_name: str) -> str:
-    """
-    Since we only use tier ID mapping now, this simply ensures
-    we return the league_name if it exists in LEAGUE_EMOJIS.
-    """
     if league_name in LEAGUE_EMOJIS:
         return league_name
     return league_name
@@ -168,22 +164,13 @@ async def fetch_player_data(session, tag, headers, trophy_cache):
                     items = hist_data.get('items', [])
                     
                     if items:
-                        # Optional Upgrade: Rank players by their best achieved tier
+                        # Rank players by their best achieved tier
                         tier_id = max(item.get('leagueTierId', 0) for item in items)
                         if tier_id in TIER_ID_TO_NAME:
                             l_name = TIER_ID_TO_NAME[tier_id]
 
-            # ---------------------------------------------------------------
-            # DEBUG — logs every player's normalized API name and weight
-            # ---------------------------------------------------------------
-            normalized = normalize_league_name(l_name)
-            weight     = get_league_weight(l_name)
-            print(
-                f"[DEBUG] {d.get('name', tag)!r:25} | "
-                f"normalized: {normalized!r:25} | "
-                f"weight: {weight}"
-            )
-            # ---------------------------------------------------------------
+            # Calculate the weight required for leaderboard sorting
+            weight = get_league_weight(l_name)
 
             player_dict = {
                 'name':          discord.utils.escape_markdown(d.get('name', 'Unknown')),
@@ -519,7 +506,6 @@ async def player_profile(interaction: discord.Interaction, player_tag: str):
             d = await r.json()
             th = d.get('townHallLevel', 1)
 
-            # Replaced fallback logic with the new leaguehistory fetch
             hist_url = f"https://api.clashofclans.com/v1/players/%23{clean_tag}/leaguehistory"
             l_name = "Unranked"
 
