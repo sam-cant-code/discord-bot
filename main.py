@@ -8,6 +8,7 @@ import os
 import time
 import logging
 import contextlib
+import datetime
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -26,7 +27,6 @@ CUSTOM_COMMANDS_FILE = 'custom_commands.json'
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
-# Fetch the Owner ID and convert it to an integer (default to 0 if missing)
 OWNER_ID = int(os.getenv('OWNER_ID', 0))
 
 intents = discord.Intents.default()
@@ -73,10 +73,8 @@ LEAGUE_EMOJIS = {
     "Legend League": "<:legend_league:1485298146186625205>"
 }
 
-# Dynamically map each league to a numerical value based on its order above
 LEAGUE_WEIGHTS = {name: i for i, name in enumerate(LEAGUE_EMOJIS.keys(), start=1)}
 
-# --- TIER ID MAPPER ---
 TIER_ID_TO_NAME = {
     105000001: "Skeleton League 1", 105000002: "Skeleton League 2", 105000003: "Skeleton League 3",
     105000004: "Barbarian League 4", 105000005: "Barbarian League 5", 105000006: "Barbarian League 6",
@@ -111,6 +109,24 @@ async def save_json_file(filepath, data):
             json.dump(data, file, indent=4)
     await asyncio.to_thread(_write)
 
+# --- MATH & FORMATTING HELPERS ---
+def calc_legend_trophies(stars, destruction):
+    """Calculates the exact trophies earned or lost in a Legend League battle."""
+    if stars == 0:
+        return destruction // 10
+    elif stars == 1:
+        return 5 + max(0, destruction - 1) // 9
+    elif stars == 2:
+        return 16 + max(0, destruction - 50) // 3
+    elif stars == 3:
+        return 40
+    return 0
+
+def to_superscript(num):
+    """Converts a standard integer string to unicode superscript characters."""
+    sup_map = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'}
+    return ''.join(sup_map.get(char, '') for char in str(num))
+
 def get_delta_str(tag, current_trophies, cache):
     if tag not in cache:
         return ""
@@ -132,7 +148,6 @@ def get_league_weight(league_name: str) -> int:
 
 # --- PERMISSION CHECK ---
 def is_admin_or_owner():
-    """Custom check that allows Server Admins OR the Bot Owner (by ID) to use a command."""
     def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user.id == OWNER_ID:
             return True
@@ -143,7 +158,6 @@ def is_admin_or_owner():
 
 # --- REUSABLE API FETCH LOGIC ---
 async def safe_fetch(session, url, headers, max_retries=3):
-    """Fetches data from the API and automatically handles 429 rate limits via exponential backoff."""
     for attempt in range(max_retries):
         try:
             async with session.get(url, headers=headers, timeout=10) as r:
@@ -170,7 +184,8 @@ async def fetch_league_history(session, tag, headers):
     if status == 200 and hist_data:
         items = hist_data.get('items', [])
         if items:
-            tier_id = max(item.get('leagueTierId', 0) for item in items)
+            latest_item = sorted(items, key=lambda x: str(x.get('season', '')))[-1]
+            tier_id = latest_item.get('leagueTierId', 0)
             l_name = TIER_ID_TO_NAME.get(tier_id, "Unranked")
     elif status != 200 and status is not None:
         logger.warning(f"History API returned {status} for #{tag}. Falling back to Unranked.")
@@ -192,6 +207,62 @@ async def fetch_player_data(session, tag, headers, trophy_cache, semaphore=None)
             
             l_name = await fetch_league_history(session, tag, headers)
             weight = get_league_weight(l_name)
+            
+            # --- FETCH DAILY LEGEND STATS IF APPLICABLE ---
+            legend_log = None
+            if weight == 34:  # 34 is the weight for Legend League
+                log_url = f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog"
+                log_status, log_data = await safe_fetch(session, log_url, headers)
+                
+                if log_status == 403:
+                    legend_log = "private"
+                elif log_status == 200 and log_data:
+                    off_count, off_trophies, def_count, def_trophies = 0, 0, 0, 0
+                    
+                    # Legend League day resets at 05:00 AM UTC
+                    now = datetime.datetime.utcnow()
+                    if now.hour >= 5:
+                        day_start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+                    else:
+                        day_start = (now - datetime.timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
+                        
+                    for battle in log_data.get('items', []):
+                        if battle.get('battleType') == 'legend':
+                            b_time_str = battle.get('battleTime')
+                            is_today = False
+                            
+                            if b_time_str:
+                                try:
+                                    clean_time = b_time_str.replace('Z', '')
+                                    if '.' in clean_time:
+                                        clean_time = clean_time.split('.')[0]
+                                    b_dt = datetime.datetime.strptime(clean_time, "%Y%m%dT%H%M%S")
+                                    is_today = b_dt >= day_start
+                                except Exception:
+                                    is_today = True 
+                            else:
+                                is_today = True 
+                                
+                            if is_today:
+                                is_attack = battle.get('attack', False)
+                                stars = battle.get('stars', 0)
+                                dest = battle.get('destructionPercentage', 0)
+                                trophies = calc_legend_trophies(stars, dest)
+                                
+                                if is_attack and off_count < 8:
+                                    off_trophies += trophies
+                                    off_count += 1
+                                elif not is_attack and def_count < 8:
+                                    def_trophies += trophies
+                                    def_count += 1
+                                    
+                            if b_time_str and not is_today:
+                                break
+                    
+                    legend_log = {
+                        'off_count': off_count, 'off_trophies': off_trophies,
+                        'def_count': def_count, 'def_trophies': def_trophies
+                    }
 
             player_dict = {
                 'name':          discord.utils.escape_markdown(d.get('name', 'Unknown')),
@@ -200,7 +271,8 @@ async def fetch_player_data(session, tag, headers, trophy_cache, semaphore=None)
                 'league_weight': weight,
                 'th':            th,
                 'tag':           tag,
-                'delta':         get_delta_str(tag, current_trophies, trophy_cache)
+                'delta':         get_delta_str(tag, current_trophies, trophy_cache),
+                'legend_log':    legend_log
             }
             return player_dict, tag, current_trophies, d
         else:
@@ -250,7 +322,21 @@ async def build_leaderboard_embeds(bot):
         desc = ""
         for j, p in enumerate(chunk, start=i + 1):
             profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag']}"
-            desc += f"**{j}.** {p['emoji']} [**{p['name']}**]({profile_url}) | {p['trophies']} {TROPHY_EMOJI}{p['delta']} | TH{p['th']}\n"
+            
+            # Base text with main trophy number bolded
+            line = f"**{j}.** {p['emoji']} [**{p['name']}**]({profile_url}) | **{p['trophies']}** {TROPHY_EMOJI}{p['delta']}"
+            
+            # Append Legend League daily tracking inline if applicable
+            if p.get('league_weight') == 34:
+                ll = p.get('legend_log')
+                if ll == "private":
+                    line += " | 🔒 Private"
+                elif isinstance(ll, dict):
+                    sup_off = to_superscript(ll['off_count'])
+                    sup_def = to_superscript(ll['def_count'])
+                    line += f" |  +{ll['off_trophies']}{sup_off} |  -{ll['def_trophies']}{sup_def}"
+                    
+            desc += line + "\n"
 
         embed = discord.Embed(
             title=f"{TROPHY_EMOJI} Server Leaderboard {TROPHY_EMOJI}",
@@ -327,13 +413,29 @@ class LeaderboardView(discord.ui.View):
             )
             return
 
-        await interaction.response.defer()
+        if self.embeds:
+            loading_embed = self.embeds[self.current_page].copy()
+            loading_embed.set_footer(text="⏳ Fetching latest data from Clash of Clans API, please wait...")
+        else:
+            loading_embed = discord.Embed(
+                title=f"{TROPHY_EMOJI} Server Leaderboard {TROPHY_EMOJI}",
+                description="⏳ Fetching latest data from Clash of Clans API, please wait...",
+                color=discord.Color.gold()
+            )
+        
+        for child in self.children:
+            child.disabled = True
+            
+        await interaction.response.edit_message(embed=loading_embed, view=self)
         
         self.bot.last_refresh_time = current_time
         new_embeds = await build_leaderboard_embeds(self.bot)
         
         self.embeds = new_embeds
         self.current_page = min(self.current_page, len(self.embeds) - 1)
+        
+        for child in self.children:
+            child.disabled = False
         self.update_buttons()
         self.save_state(interaction)
         
