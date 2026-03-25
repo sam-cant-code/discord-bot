@@ -9,6 +9,7 @@ import time
 import logging
 import contextlib
 import datetime
+from wcwidth import wcwidth
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -24,6 +25,7 @@ PLAYERS_FILE = 'players.json'
 CONFIG_FILE = 'lb_config.json'
 TROPHY_CACHE_FILE = 'trophy_cache.json'
 CUSTOM_COMMANDS_FILE = 'custom_commands.json'
+LEGEND_STATS_FILE = 'legend_stats.json'
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
@@ -110,8 +112,35 @@ async def save_json_file(filepath, data):
     await asyncio.to_thread(_write)
 
 # --- MATH & FORMATTING HELPERS ---
+def format_name_strict(name, max_width=10):
+    """Truncates and pads names using wcwidth for true visual terminal alignment."""
+    safe_name = name.replace('`', "'").replace('☆', '⭐')
+    
+    result = ""
+    current_width = 0
+    
+    for i, char in enumerate(safe_name):
+        w = wcwidth(char)
+        if w < 0: w = 0  
+        
+        if current_width + w > max_width:
+            break
+            
+        if current_width + w > max_width - 2 and i < len(safe_name) - 1:
+            result += ".."
+            current_width += 2
+            break
+            
+        result += char
+        current_width += w
+
+    while current_width < max_width:
+        result += " " 
+        current_width += 1
+
+    return result
+
 def calc_legend_trophies(stars, destruction):
-    """Calculates the exact trophies earned or lost in a Legend League battle."""
     if stars == 0:
         return destruction // 10
     elif stars == 1:
@@ -121,11 +150,6 @@ def calc_legend_trophies(stars, destruction):
     elif stars == 3:
         return 40
     return 0
-
-def to_superscript(num):
-    """Converts a standard integer string to unicode superscript characters."""
-    sup_map = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'}
-    return ''.join(sup_map.get(char, '') for char in str(num))
 
 def get_delta_str(tag, current_trophies, cache):
     if tag not in cache:
@@ -192,7 +216,7 @@ async def fetch_league_history(session, tag, headers):
         
     return l_name
 
-async def fetch_player_data(session, tag, headers, trophy_cache, semaphore=None):
+async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, semaphore=None):
     async with (semaphore or contextlib.nullcontext()):
         await asyncio.sleep(0.1)
         
@@ -208,60 +232,87 @@ async def fetch_player_data(session, tag, headers, trophy_cache, semaphore=None)
             l_name = await fetch_league_history(session, tag, headers)
             weight = get_league_weight(l_name)
             
-            # --- FETCH DAILY LEGEND STATS IF APPLICABLE ---
+            # --- FETCH INCREMENTAL LEGEND STATS ---
             legend_log = None
-            if weight == 34:  # 34 is the weight for Legend League
+            if weight == 34:  # Legend League
+                if tag not in legend_stats_cache:
+                    legend_stats_cache[tag] = {
+                        "last_seen_battle": None,
+                        "off_count": 0,
+                        "off_trophies": 0,
+                        "def_count": 0,
+                        "def_trophies": 0,
+                        "last_reset": None
+                    }
+                
+                p_stats = legend_stats_cache[tag]
+
+                # 1. Determine Legend Day (Resets at 05:00 UTC)
+                now = datetime.datetime.utcnow()
+                if now.hour >= 5:
+                    current_day = now.date()
+                else:
+                    current_day = (now - datetime.timedelta(days=1)).date()
+                current_day_str = current_day.isoformat()
+
+                # 2. Reset stats if a new day has started
+                if p_stats.get("last_reset") != current_day_str:
+                    p_stats["off_count"] = 0
+                    p_stats["off_trophies"] = 0
+                    p_stats["def_count"] = 0
+                    p_stats["def_trophies"] = 0
+                    p_stats["last_reset"] = current_day_str
+
+                # 3. Fetch log and calculate incrementally
                 log_url = f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog"
                 log_status, log_data = await safe_fetch(session, log_url, headers)
                 
                 if log_status == 403:
                     legend_log = "private"
                 elif log_status == 200 and log_data:
-                    off_count, off_trophies, def_count, def_trophies = 0, 0, 0, 0
+                    items = log_data.get('items', [])
+                    legend_battles = [b for b in items if b.get('battleType') == 'legend']
                     
-                    # Legend League day resets at 05:00 AM UTC
-                    now = datetime.datetime.utcnow()
-                    if now.hour >= 5:
-                        day_start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+                    if not p_stats.get("last_seen_battle"):
+                        # First initialization: Do NOT process old battles. Just set marker to latest battle.
+                        if legend_battles:
+                            p_stats["last_seen_battle"] = legend_battles[0].get("battleTime")
                     else:
-                        day_start = (now - datetime.timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
+                        # Find all new battles
+                        new_battles = []
+                        for b in legend_battles:
+                            if b.get("battleTime") == p_stats["last_seen_battle"]:
+                                break
+                            new_battles.append(b)
                         
-                    for battle in log_data.get('items', []):
-                        if battle.get('battleType') == 'legend':
-                            b_time_str = battle.get('battleTime')
-                            is_today = False
-                            
-                            if b_time_str:
-                                try:
-                                    clean_time = b_time_str.replace('Z', '')
-                                    if '.' in clean_time:
-                                        clean_time = clean_time.split('.')[0]
-                                    b_dt = datetime.datetime.strptime(clean_time, "%Y%m%dT%H%M%S")
-                                    is_today = b_dt >= day_start
-                                except Exception:
-                                    is_today = True 
-                            else:
-                                is_today = True 
-                                
-                            if is_today:
-                                is_attack = battle.get('attack', False)
-                                stars = battle.get('stars', 0)
-                                dest = battle.get('destructionPercentage', 0)
+                        if new_battles:
+                            # Process oldest to newest among the new ones
+                            for b in reversed(new_battles):
+                                is_attack = b.get('attack', False)
+                                stars = b.get('stars', 0)
+                                dest = b.get('destructionPercentage', 0)
                                 trophies = calc_legend_trophies(stars, dest)
                                 
-                                if is_attack and off_count < 8:
-                                    off_trophies += trophies
-                                    off_count += 1
-                                elif not is_attack and def_count < 8:
-                                    def_trophies += trophies
-                                    def_count += 1
-                                    
-                            if b_time_str and not is_today:
-                                break
-                    
+                                if is_attack:
+                                    if p_stats["off_count"] < 8:
+                                        p_stats["off_trophies"] += trophies
+                                        p_stats["off_count"] += 1
+                                else:
+                                    if p_stats["def_count"] < 8:
+                                        if stars == 0:
+                                            trophies = 0
+                                        p_stats["def_trophies"] += trophies
+                                        p_stats["def_count"] += 1
+                            
+                            # Update marker to the absolute newest battle processed
+                            p_stats["last_seen_battle"] = new_battles[0].get("battleTime")
+
+                if legend_log != "private":
                     legend_log = {
-                        'off_count': off_count, 'off_trophies': off_trophies,
-                        'def_count': def_count, 'def_trophies': def_trophies
+                        'off_count': p_stats['off_count'],
+                        'off_trophies': p_stats['off_trophies'],
+                        'def_count': p_stats['def_count'],
+                        'def_trophies': p_stats['def_trophies']
                     }
 
             player_dict = {
@@ -295,13 +346,15 @@ async def build_leaderboard_embeds(bot):
         return [embed]
 
     trophy_cache = await load_json_file(TROPHY_CACHE_FILE, {})
+    legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
+    
     new_cache = {}
     data_list = []
     headers = {'Authorization': f'Bearer {COC_TOKEN}'}
     
     semaphore = asyncio.Semaphore(3)
 
-    fetch_tasks = [fetch_player_data(bot.session, tag, headers, trophy_cache, semaphore) for tag in players]
+    fetch_tasks = [fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, semaphore) for tag in players]
     results = await asyncio.gather(*fetch_tasks)
 
     for player_dict, tag, current_trophies, _ in results:
@@ -310,6 +363,7 @@ async def build_leaderboard_embeds(bot):
             new_cache[tag] = current_trophies
 
     await save_json_file(TROPHY_CACHE_FILE, new_cache)
+    await save_json_file(LEGEND_STATS_FILE, legend_stats_cache) # Save incremental progress
 
     data_list.sort(key=lambda x: (x['league_weight'], x['trophies']), reverse=True)
 
@@ -321,21 +375,34 @@ async def build_leaderboard_embeds(bot):
         chunk = data_list[i:i + chunk_size]
         desc = ""
         for j, p in enumerate(chunk, start=i + 1):
-            profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag']}"
             
-            # Base text with main trophy number bolded
-            line = f"**{j}.** {p['emoji']} [**{p['name']}**]({profile_url}) | **{p['trophies']}** {TROPHY_EMOJI}{p['delta']}"
+            # --- TRUE VISUAL COLUMN SYSTEM ---
+            rank_str = f"{j}.".ljust(3)
+            display_name = format_name_strict(p['name'], 10)
+            trophies_str = f"{p['trophies']:>4}"
             
-            # Append Legend League daily tracking inline if applicable
+            # Generate the official deep link to the player's profile
+            clean_tag = p['tag'].replace('#', '')
+            profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={clean_tag}"
+            
+            # Assemble base line: The name gets linked, the trophies sit outside the link bracket.
+            line = f"`{rank_str}`{p['emoji']} [`{display_name}`]({profile_url})`|{trophies_str}`{TROPHY_EMOJI}"
+            
+            # Legend League tracking
             if p.get('league_weight') == 34:
                 ll = p.get('legend_log')
                 if ll == "private":
-                    line += " | 🔒 Private"
+                    line += " | `🔒 Private`"
                 elif isinstance(ll, dict):
-                    sup_off = to_superscript(ll['off_count'])
-                    sup_def = to_superscript(ll['def_count'])
-                    line += f" |  +{ll['off_trophies']}{sup_off} |  -{ll['def_trophies']}{sup_def}"
+                    # Simplified layout: Just attack + defense trophies
+                    off_str = f"+{ll['off_trophies']}".ljust(4)
+                    def_str = f"-{ll['def_trophies']}".ljust(4)
                     
+                    line += f" | `{off_str}| {def_str}`"
+                    
+            if p['delta']:
+                line += p['delta']
+                
             desc += line + "\n"
 
         embed = discord.Embed(
@@ -681,15 +748,19 @@ async def player_profile(interaction: discord.Interaction, player_tag: str):
     clean_tag = player_tag.strip().lstrip('#').upper()
     headers = {'Authorization': f'Bearer {COC_TOKEN}'}
     
+    legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
     player_dict, _, _, raw_data = await fetch_player_data(
-        interaction.client.session, clean_tag, headers, {}, semaphore=None
+        interaction.client.session, clean_tag, headers, {}, legend_stats_cache, semaphore=None
     )
+    await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
 
     if raw_data:
         clan = raw_data.get('clan', {}).get('name', 'No Clan')
         role = raw_data.get('role', 'Member').capitalize() if raw_data.get('clan') else 'N/A'
+        
+        profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={clean_tag}"
 
-        embed = discord.Embed(title=f"{player_dict['emoji']} {raw_data.get('name')} (TH{player_dict['th']})", color=discord.Color.blue())
+        embed = discord.Embed(title=f"{player_dict['emoji']} {raw_data.get('name')} (TH{player_dict['th']})", url=profile_url, color=discord.Color.blue())
         embed.add_field(name="Clan", value=f"{clan} ({role})", inline=False)
         embed.add_field(name="Trophies", value=f"{TROPHY_EMOJI} {raw_data.get('trophies')} (Best: {raw_data.get('bestTrophies')})", inline=True)
         embed.add_field(name="War Stars", value=f"⭐ {raw_data.get('warStars')}", inline=True)
