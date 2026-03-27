@@ -9,7 +9,6 @@ import time
 import logging
 import contextlib
 import datetime
-from wcwidth import wcwidth
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -113,32 +112,20 @@ async def save_json_file(filepath, data):
 
 # --- MATH & FORMATTING HELPERS ---
 def format_name_strict(name, max_width=10):
-    """Truncates and pads names using wcwidth for true visual terminal alignment."""
-    safe_name = name.replace('`', "'").replace('☆', '⭐')
+    """
+    Creates a strict bounding box based on character count.
+    Note: Emojis and CJK characters will still cause slight visual 
+    misalignment in Discord because they take up more horizontal pixels.
+    """
+    # Remove backticks so they don't break the Discord markdown
+    safe_name = name.replace('`', "'")
     
-    result = ""
-    current_width = 0
-    
-    for i, char in enumerate(safe_name):
-        w = wcwidth(char)
-        if w < 0: w = 0  
+    # If the name is longer than the max width, chop it off and add ".."
+    if len(safe_name) > max_width:
+        safe_name = safe_name[:max_width - 2] + ".."
         
-        if current_width + w > max_width:
-            break
-            
-        if current_width + w > max_width - 2 and i < len(safe_name) - 1:
-            result += ".."
-            current_width += 2
-            break
-            
-        result += char
-        current_width += w
-
-    while current_width < max_width:
-        result += " " 
-        current_width += 1
-
-    return result
+    # Pad shorter names with spaces to fill the box
+    return safe_name.ljust(max_width, ' ')
 
 def calc_legend_trophies(stars, destruction):
     if stars == 0:
@@ -174,7 +161,6 @@ def get_league_emoji(league_name: str) -> str:
 def get_league_weight(league_name: str) -> int:
     return LEAGUE_WEIGHTS.get(league_name, 0)
 
-# --- HELPER: Create a unique fingerprint for a battle since CoC API has no timestamps ---
 def get_battle_sig(b):
     return f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}"
 
@@ -237,24 +223,20 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
 
             await asyncio.sleep(0.1)
             
-            # --- FIX: Extract league from the profile directly, mapping ID to exactly match the EMOJI dictionary ---
             league_tier_id = d.get('leagueTier', {}).get('id')
             if league_tier_id and league_tier_id in TIER_ID_TO_NAME:
                 l_name = TIER_ID_TO_NAME[league_tier_id]
             else:
-                # Fallback to string name or old formatting just in case
                 league_obj = d.get('leagueTier') or d.get('league') or {}
                 l_name = league_obj.get('name', 'Unranked')
 
-            # Only fallback to the expensive history fetch if they are totally unranked right now
             if l_name == "Unranked":
                 l_name = await fetch_league_history(session, tag, headers)
                 
             weight = get_league_weight(l_name)
             
-            # --- FETCH INCREMENTAL LEGEND STATS ---
             legend_log = None
-            if weight == 34:  # Legend League
+            if weight == 34:  
                 if tag not in legend_stats_cache:
                     legend_stats_cache[tag] = {
                         "seen_battles": [], 
@@ -268,7 +250,6 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                 
                 p_stats = legend_stats_cache[tag]
 
-                # 1. Determine Legend Day (Resets at 05:00 UTC)
                 now = datetime.datetime.now(datetime.timezone.utc)
                 if now.hour >= 5:
                     current_day = now.date()
@@ -276,7 +257,6 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                     current_day = (now - datetime.timedelta(days=1)).date()
                 current_day_str = current_day.isoformat()
 
-                # 2. Reset stats if a new day has started
                 if p_stats.get("last_reset") != current_day_str:
                     p_stats["off_count"] = 0
                     p_stats["off_trophies"] = 0
@@ -285,7 +265,6 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                     p_stats["last_reset"] = current_day_str
                     logger.info(f"🔄 [{tag}] New Legend Day! Stats reset to 0.")
 
-                # 3. Fetch log and calculate incrementally
                 log_url = f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog"
                 log_status, log_data = await safe_fetch(session, log_url, headers)
                 
@@ -296,12 +275,10 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                     legend_battles = [b for b in items if b.get('battleType') == 'legend']
                     
                     if not p_stats.get("initialized"):
-                        # First run: Memorize all current battle fingerprints so we don't count old data
                         p_stats["seen_battles"] = [get_battle_sig(b) for b in legend_battles]
                         p_stats["initialized"] = True
                         logger.info(f"🚨 [{tag}] FIRST RUN! Memorized {len(p_stats['seen_battles'])} old battles.")
                     else:
-                        # Find all NEW battles by checking if their fingerprint is missing from our memory
                         new_battles = []
                         seen_set = set(p_stats.get("seen_battles", []))
                         
@@ -312,7 +289,6 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                         
                         if new_battles:
                             logger.info(f"✅ [{tag}] Found {len(new_battles)} NEW battles to process!")
-                            # Process oldest to newest
                             for b in reversed(new_battles):
                                 sig = get_battle_sig(b)
                                 is_attack = b.get('attack', False)
@@ -333,10 +309,8 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                                         p_stats["def_count"] += 1
                                         logger.info(f"🛡️ [{tag}] Processed Defense: -{trophies}")
                                 
-                                # Memorize the new battle
                                 p_stats["seen_battles"].append(sig)
                             
-                            # Keep only the last 100 fingerprints to prevent the JSON file from getting huge
                             p_stats["seen_battles"] = p_stats["seen_battles"][-100:]
 
                 if legend_log != "private":
@@ -408,29 +382,24 @@ async def build_leaderboard_embeds(bot):
         desc = ""
         for j, p in enumerate(chunk, start=i + 1):
             
-            # --- TRUE VISUAL COLUMN SYSTEM ---
+            # --- TRUE VISUAL COLUMN SYSTEM WITH YOUR ORIGINAL LAYOUT ---
             rank_str = f"{j}.".ljust(3)
             display_name = format_name_strict(p['name'], 10)
             trophies_str = f"{p['trophies']:>4}"
             
-            # Generate the official deep link to the player's profile
             clean_tag = p['tag'].replace('#', '')
             profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={clean_tag}"
             
-            # Only the name is a markdown hyperlink; the pipe and trophies remain in standard backticks
             line = f"`{rank_str}`{p['emoji']} [**`{display_name}`**]({profile_url})`|{trophies_str}`{TROPHY_EMOJI}"
             
-            # Legend League tracking
             if p.get('league_weight') == 34:
                 ll = p.get('legend_log')
                 if ll == "private":
                     line += " | `🔒 Private`"
                 elif isinstance(ll, dict):
-                    # Convert the counts to superscripts
                     sup_off = to_superscript(ll['off_count'])
                     sup_def = to_superscript(ll['def_count'])
                     
-                    # Pad out the strings to keep the columns aligned
                     off_str = f"+{ll['off_trophies']}{sup_off}".ljust(5)
                     def_str = f"-{ll['def_trophies']}{sup_def}".ljust(5)
                     
@@ -794,7 +763,6 @@ async def player_profile(interaction: discord.Interaction, player_tag: str):
         clan = raw_data.get('clan', {}).get('name', 'No Clan')
         role = raw_data.get('role', 'Member').capitalize() if raw_data.get('clan') else 'N/A'
         
-        # Link the profile command embed title too!
         profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={clean_tag}"
 
         embed = discord.Embed(title=f"{player_dict['emoji']} {raw_data.get('name')} (TH{player_dict['th']})", url=profile_url, color=discord.Color.blue())
