@@ -237,7 +237,19 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
 
             await asyncio.sleep(0.1)
             
-            l_name = await fetch_league_history(session, tag, headers)
+            # --- FIX: Extract league from the profile directly, mapping ID to exactly match the EMOJI dictionary ---
+            league_tier_id = d.get('leagueTier', {}).get('id')
+            if league_tier_id and league_tier_id in TIER_ID_TO_NAME:
+                l_name = TIER_ID_TO_NAME[league_tier_id]
+            else:
+                # Fallback to string name or old formatting just in case
+                league_obj = d.get('leagueTier') or d.get('league') or {}
+                l_name = league_obj.get('name', 'Unranked')
+
+            # Only fallback to the expensive history fetch if they are totally unranked right now
+            if l_name == "Unranked":
+                l_name = await fetch_league_history(session, tag, headers)
+                
             weight = get_league_weight(l_name)
             
             # --- FETCH INCREMENTAL LEGEND STATS ---
