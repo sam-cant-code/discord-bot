@@ -9,6 +9,7 @@ import time
 import logging
 import contextlib
 import datetime
+import re
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -27,6 +28,7 @@ CUSTOM_COMMANDS_FILE = 'custom_commands.json'
 LEGEND_STATS_FILE = 'legend_stats.json'
 SUPERWHOO_FILE = 'superwhoo_stats.json'
 NAME_CACHE_FILE = 'name_cache.json'
+ARMIES_DB_FILE = 'armies_db.json'
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
@@ -186,6 +188,35 @@ def get_league_weight(league_name: str) -> int:
 def get_battle_sig(b):
     return f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}"
 
+def get_army_summary(share_code: str) -> str:
+    """Helper to convert the army string to a readable preview (Full army, no spaces)."""
+    unit_dict = {
+        0: "barbarian", 1: "archer", 2: "goblin", 3: "giant", 4: "wallbreaker",
+        5: "balloon", 6: "wizard", 7: "healer", 8: "dragon", 9: "pekka",
+        10: "minion", 11: "hogrider", 12: "valkyrie", 13: "golem", 15: "witch", 
+        17: "lavahound", 22: "bowler", 23: "babydragon", 24: "miner", 26: "superbarbarian", 
+        27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 
+        53: "yeti", 57: "superwallbreaker", 58: "icegolem", 59: "electrodragon", 62: "stoneslammer", 
+        63: "infernodragon", 65: "dragonrider", 66: "superminion", 75: "siegebarracks", 
+        80: "rocketballoon", 82: "headhunter", 87: "loglauncher", 91: "flameflinger", 92: "battledrill", 
+        95: "electrotitan", 97: "apprenticewarden", 110: "rootrider", 132: "thrower", 
+        147: "meteorgolem", 150: "furnace", 177: "smasher"
+    }
+    
+    u_match = re.search(r'u([\d\-x]+)', share_code)
+    if not u_match:
+        return "unknowntroops"
+        
+    units = []
+    for item in u_match.group(1).split('-'):
+        if 'x' in item:
+            qty, u_id = item.split('x')
+            name = unit_dict.get(int(u_id), f"unit{u_id}")
+            units.append(f"{qty}x{name}")
+            
+    # Join with commas, no spaces
+    return ",".join(units)
+
 # --- PERMISSION CHECK ---
 def is_admin_or_owner():
     def predicate(interaction: discord.Interaction) -> bool:
@@ -232,7 +263,7 @@ async def fetch_league_history(session, tag, headers):
         
     return l_name
 
-async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, semaphore=None):
+async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, armies_db, semaphore=None):
     async with (semaphore or contextlib.nullcontext()):
         await asyncio.sleep(0.1)
         
@@ -258,42 +289,82 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
             weight = get_league_weight(l_name)
             
             legend_log = None
-            if weight == 34:  
-                if tag not in legend_stats_cache:
-                    legend_stats_cache[tag] = {
-                        "seen_battles": [], 
-                        "initialized": False,
-                        "off_count": 0,
-                        "off_trophies": 0,
-                        "def_count": 0,
-                        "def_trophies": 0,
-                        "last_reset": None
-                    }
+            
+            # Fetch battle log for both Legend Stats AND Armies DB
+            log_url = f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog"
+            log_status, log_data = await safe_fetch(session, log_url, headers)
+            
+            if log_status == 200 and log_data:
+                items = log_data.get('items', [])
                 
-                p_stats = legend_stats_cache[tag]
-
-                now = datetime.datetime.now(datetime.timezone.utc)
-                if now.hour >= 5:
-                    current_day = now.date()
-                else:
-                    current_day = (now - datetime.timedelta(days=1)).date()
-                current_day_str = current_day.isoformat()
-
-                if p_stats.get("last_reset") != current_day_str:
-                    p_stats["off_count"] = 0
-                    p_stats["off_trophies"] = 0
-                    p_stats["def_count"] = 0
-                    p_stats["def_trophies"] = 0
-                    p_stats["last_reset"] = current_day_str
-                    logger.info(f"🔄 [{tag}] New Legend Day! Stats reset to 0.")
-
-                log_url = f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog"
-                log_status, log_data = await safe_fetch(session, log_url, headers)
+                # --- 1. PROCESS PERMANENT ARMIES DB ---
+                if tag not in armies_db:
+                    armies_db[tag] = {"seen_battles": [], "ranked": {}, "unranked": {}}
+                    
+                p_armies = armies_db[tag]
                 
-                if log_status == 403:
-                    legend_log = "private"
-                elif log_status == 200 and log_data:
-                    items = log_data.get('items', [])
+                # Backward compatibility: Upgrade old DB format to new Ranked/Unranked split
+                if "armies" in p_armies:
+                    p_armies["ranked"] = p_armies.pop("armies")
+                if "ranked" not in p_armies:
+                    p_armies["ranked"] = {}
+                if "unranked" not in p_armies:
+                    p_armies["unranked"] = {}
+                
+                for b in items:
+                    # FIX: Use the reliable get_battle_sig since battleTime is not always provided by the API!
+                    sig = get_battle_sig(b)
+                    
+                    if sig not in p_armies["seen_battles"]:
+                        p_armies["seen_battles"].append(sig)
+                        
+                        # Only track attacks with a share code
+                        if b.get('attack') is True and 'armyShareCode' in b:
+                            b_type = b.get('battleType')
+                            category = "ranked" if b_type in ['legend', 'homeVillage'] else "unranked"
+                            code = b['armyShareCode']
+                            dest = b.get('destructionPercentage', 0)
+                            
+                            if code not in p_armies[category]:
+                                p_armies[category][code] = {"uses": 0, "total_dest": 0}
+                                
+                            p_armies[category][code]["uses"] += 1
+                            p_armies[category][code]["total_dest"] += dest
+                                
+                # Keep the seen list from growing forever (store last 200 battle IDs)
+                p_armies["seen_battles"] = p_armies["seen_battles"][-200:]
+                
+                
+                # --- 2. PROCESS LEGEND STATS ---
+                if weight == 34:  
+                    if tag not in legend_stats_cache:
+                        legend_stats_cache[tag] = {
+                            "seen_battles": [], 
+                            "initialized": False,
+                            "off_count": 0,
+                            "off_trophies": 0,
+                            "def_count": 0,
+                            "def_trophies": 0,
+                            "last_reset": None
+                        }
+                    
+                    p_stats = legend_stats_cache[tag]
+
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    if now.hour >= 5:
+                        current_day = now.date()
+                    else:
+                        current_day = (now - datetime.timedelta(days=1)).date()
+                    current_day_str = current_day.isoformat()
+
+                    if p_stats.get("last_reset") != current_day_str:
+                        p_stats["off_count"] = 0
+                        p_stats["off_trophies"] = 0
+                        p_stats["def_count"] = 0
+                        p_stats["def_trophies"] = 0
+                        p_stats["last_reset"] = current_day_str
+                        logger.info(f"🔄 [{tag}] New Legend Day! Stats reset to 0.")
+
                     legend_battles = [b for b in items if b.get('battleType') == 'legend']
                     
                     if not p_stats.get("initialized"):
@@ -335,16 +406,17 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                             
                             p_stats["seen_battles"] = p_stats["seen_battles"][-100:]
 
-                if legend_log != "private":
                     legend_log = {
                         'off_count': p_stats['off_count'],
                         'off_trophies': p_stats['off_trophies'],
                         'def_count': p_stats['def_count'],
                         'def_trophies': p_stats['def_trophies']
                     }
+            elif log_status == 403 and weight == 34:
+                legend_log = "private"
 
             player_dict = {
-                'name':          discord.utils.escape_markdown(d.get('name', 'Unknown')),
+                'name':         discord.utils.escape_markdown(d.get('name', 'Unknown')),
                 'trophies':      current_trophies,
                 'emoji':         get_league_emoji(l_name),
                 'league_weight': weight,
@@ -456,6 +528,7 @@ async def build_leaderboard_embeds(bot):
     trophy_cache = await load_json_file(TROPHY_CACHE_FILE, {})
     legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
     name_cache = await load_json_file(NAME_CACHE_FILE, {}) 
+    armies_db = await load_json_file(ARMIES_DB_FILE, {})
     
     new_cache = {}
     data_list = []
@@ -464,7 +537,7 @@ async def build_leaderboard_embeds(bot):
     
     semaphore = asyncio.Semaphore(3)
 
-    fetch_tasks = [fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, semaphore) for tag in players]
+    fetch_tasks = [fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, armies_db, semaphore) for tag in players]
     results = await asyncio.gather(*fetch_tasks)
 
     for player_dict, tag, current_trophies, raw_data in results:
@@ -481,6 +554,7 @@ async def build_leaderboard_embeds(bot):
     await save_json_file(TROPHY_CACHE_FILE, new_cache)
     await save_json_file(LEGEND_STATS_FILE, legend_stats_cache) 
     await save_json_file(NAME_CACHE_FILE, name_cache) 
+    await save_json_file(ARMIES_DB_FILE, armies_db)
 
     data_list.sort(key=lambda x: (x['league_weight'], x['trophies']), reverse=True)
 
@@ -891,10 +965,13 @@ async def player_profile(interaction: discord.Interaction, player: str):
     headers = {'Authorization': f'Bearer {COC_TOKEN}'}
     
     legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
+    armies_db = await load_json_file(ARMIES_DB_FILE, {}) 
+    
     player_dict, _, _, raw_data = await fetch_player_data(
-        interaction.client.session, target_tag, headers, {}, legend_stats_cache, semaphore=None
+        interaction.client.session, target_tag, headers, {}, legend_stats_cache, armies_db, semaphore=None
     )
     await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
+    await save_json_file(ARMIES_DB_FILE, armies_db) 
 
     if raw_data:
         clan = raw_data.get('clan', {}).get('name', 'No Clan')
@@ -917,6 +994,79 @@ async def player_profile(interaction: discord.Interaction, player: str):
         await interaction.followup.send(embed=embed)
     else:
         await interaction.followup.send("❌ Could not find that player, or the API is currently unavailable.")
+
+
+@bot.tree.command(name='armies', description="Shows the armies a player is currently using.")
+@app_commands.describe(player="Search by Player Name or Tag", mode="Choose Ranked or Unranked armies")
+@app_commands.autocomplete(player=player_autocomplete)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Ranked (Multiplayer/Legend)", value="ranked"),
+    app_commands.Choice(name="Unranked (War/Friendly)", value="unranked")
+])
+async def player_armies(interaction: discord.Interaction, player: str, mode: str = "ranked"):
+    await interaction.response.defer()
+    
+    target_tag = await resolve_player_input(player)
+    if not target_tag:
+        await interaction.followup.send("❌ Please provide a valid player name or tag.")
+        return
+        
+    armies_db = await load_json_file(ARMIES_DB_FILE, {})
+    
+    # Backwards compatibility check
+    if target_tag in armies_db and "armies" in armies_db[target_tag]:
+        armies_db[target_tag]["ranked"] = armies_db[target_tag].pop("armies")
+        if "unranked" not in armies_db[target_tag]:
+            armies_db[target_tag]["unranked"] = {}
+            
+    # --- NEW: Fallback Live Fetch ---
+    # If we don't have data for this player, fetch it right now before giving up!
+    if target_tag not in armies_db or not armies_db[target_tag].get(mode):
+        headers = {'Authorization': f'Bearer {COC_TOKEN}'}
+        legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
+        trophy_cache = await load_json_file(TROPHY_CACHE_FILE, {})
+        
+        # This fetches their log and updates armies_db automatically
+        await fetch_player_data(interaction.client.session, target_tag, headers, trophy_cache, legend_stats_cache, armies_db)
+        
+        await save_json_file(ARMIES_DB_FILE, armies_db)
+        await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
+        await save_json_file(TROPHY_CACHE_FILE, trophy_cache)
+
+    # Check ONE MORE TIME after the live fetch
+    if target_tag not in armies_db or not armies_db[target_tag].get(mode):
+        await interaction.followup.send(f"⚠️ No tracked **{mode}** armies found for this player. They might not have any recent attacks of this type in their log.")
+        return
+        
+    armies = armies_db[target_tag][mode]
+        
+    # Sort armies by most used
+    sorted_armies = sorted(armies.items(), key=lambda x: x[1]['uses'], reverse=True)
+    
+    # Try to get player name for a nice embed title
+    name_cache = await load_json_file(NAME_CACHE_FILE, {})
+    display_name = name_cache.get(target_tag, f"#{target_tag}")
+    
+    title_mode = "Ranked" if mode == "ranked" else "Unranked (War/Friendly)"
+    
+    embed = discord.Embed(
+        title=f"⚔️ All-Time {title_mode} Armies for {display_name}",
+        description=f"Based on their tracked {mode} attacks.",
+        color=discord.Color.brand_green() if mode == "ranked" else discord.Color.orange()
+    )
+    
+    for i, (code, stats) in enumerate(sorted_armies[:5]):  # Show up to the top 5 armies
+        avg_dest = stats['total_dest'] / stats['uses']
+        summary = get_army_summary(code)
+        copy_link = f"https://link.clashofclans.com/en?action=CopyArmy&army={code}"
+        
+        embed.add_field(
+            name=f"Army {i+1} (Used {stats['uses']} times)",
+            value=f"**Avg Destruction:** {avg_dest:.1f}%\n**Troops:** {summary}\n[🔗 Click to Copy Army In-Game]({copy_link})",
+            inline=False
+        )
+        
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name='superwhoo', description="Shows the leaderboard or a specific player's 97-99% attack fails!")
@@ -1009,7 +1159,9 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
         else:
             prefix = f"`{idx}.`"
             
-        desc_text += f"{prefix} **{ranked_player['name']}** - {ranked_player['count']} Superwhoos\n"
+        safe_name = discord.utils.escape_markdown(ranked_player['name'])
+        plural = "s" if ranked_player['count'] != 1 else ""
+        desc_text += f"{prefix} **{safe_name}** - {ranked_player['count']} Superwhoo{plural}\n"
         
     embed.add_field(name="Rankings", value=desc_text, inline=False)
     await interaction.followup.send(embed=embed)
