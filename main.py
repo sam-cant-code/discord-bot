@@ -25,6 +25,8 @@ CONFIG_FILE = 'lb_config.json'
 TROPHY_CACHE_FILE = 'trophy_cache.json'
 CUSTOM_COMMANDS_FILE = 'custom_commands.json'
 LEGEND_STATS_FILE = 'legend_stats.json'
+SUPERWHOO_FILE = 'superwhoo_stats.json'
+NAME_CACHE_FILE = 'name_cache.json'
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
@@ -110,21 +112,41 @@ async def save_json_file(filepath, data):
             json.dump(data, file, indent=4)
     await asyncio.to_thread(_write)
 
+
+# --- PLAYER NAME RESOLUTION & AUTOCOMPLETE ---
+async def resolve_player_input(input_str: str) -> str:
+    """Converts a name or tag into a clean, tracking-ready tag without the '#'."""
+    if not input_str:
+        return None
+        
+    clean_input = input_str.strip()
+    name_cache = await load_json_file(NAME_CACHE_FILE, {})
+    
+    for tag, name in name_cache.items():
+        if clean_input.lower() == name.lower():
+            return tag
+            
+    return clean_input.lstrip('#').upper()
+
+async def player_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """Powers the Discord pop-up menu when typing a name or tag."""
+    name_cache = await load_json_file(NAME_CACHE_FILE, {})
+    choices = []
+    
+    for tag, name in name_cache.items():
+        if current.lower() in name.lower() or current.lower() in tag.lower():
+            choices.append(app_commands.Choice(name=f"{name} (#{tag})", value=tag))
+            if len(choices) >= 25: 
+                break
+                
+    return choices
+
+
 # --- MATH & FORMATTING HELPERS ---
 def format_name_strict(name, max_width=10):
-    """
-    Creates a strict bounding box based on character count.
-    Note: Emojis and CJK characters will still cause slight visual 
-    misalignment in Discord because they take up more horizontal pixels.
-    """
-    # Remove backticks so they don't break the Discord markdown
     safe_name = name.replace('`', "'")
-    
-    # If the name is longer than the max width, chop it off and add ".."
     if len(safe_name) > max_width:
         safe_name = safe_name[:max_width - 2] + ".."
-        
-    # Pad shorter names with spaces to fill the box
     return safe_name.ljust(max_width, ' ')
 
 def calc_legend_trophies(stars, destruction):
@@ -337,6 +359,86 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
             
         return None, tag, None, None
 
+
+# --- SUPERWHOO (97-99% WAR FAILS) LOGIC ---
+def process_war_data(war_data, superwhoo_data, tracked_clan_tags, tracked_players):
+    """Parses a war JSON and securely updates stats ONLY for actively tracked players."""
+    end_time = war_data.get('endTime', 'unknown_time')
+    
+    formatted_tracked_players = [f"#{p.lstrip('#').upper()}" for p in tracked_players]
+    
+    for clan_side in ['clan', 'opponent']:
+        side_data = war_data.get(clan_side, {})
+        side_tag = side_data.get('tag')
+        
+        if side_tag not in tracked_clan_tags:
+            continue
+            
+        members = side_data.get('members', [])
+        for member in members:
+            tag = member.get('tag')
+            name = member.get('name')
+            
+            if tag not in formatted_tracked_players:
+                continue
+            
+            if 'attacks' in member:
+                for idx, attack in enumerate(member['attacks']):
+                    dest = attack.get('destructionPercentage', 0)
+                    stars = attack.get('stars', 0)
+                    if 97 <= dest <= 99:
+                        # NEW SIGNATURE
+                        sig = f"{end_time}_{tag}_{attack.get('defenderTag')}_{idx}_{stars}_{dest}"
+                        # OLD GHOST SIGNATURE
+                        legacy_sig = f"{end_time}_{tag}_{attack.get('defenderTag')}_{idx}"
+                        
+                        if tag not in superwhoo_data:
+                            superwhoo_data[tag] = {"name": name, "count": 0, "seen": []}
+                        
+                        # --- AUTO-HEALER: Clean up old ghosts ---
+                        if legacy_sig in superwhoo_data[tag]["seen"]:
+                            superwhoo_data[tag]["seen"].remove(legacy_sig)
+                            superwhoo_data[tag]["count"] = max(0, superwhoo_data[tag]["count"] - 1)
+                            logger.info(f"Fixed legacy ghost entry for {name}")
+
+                        # Add the fresh signature
+                        if sig not in superwhoo_data[tag]["seen"]:
+                            superwhoo_data[tag]["count"] += 1
+                            superwhoo_data[tag]["seen"].append(sig)
+                            superwhoo_data[tag]["seen"] = superwhoo_data[tag]["seen"][-50:]
+                            superwhoo_data[tag]["name"] = name 
+
+async def process_clan_wars(bot, clan_tags, tracked_players):
+    """Background task to fetch wars for unique clans and track Superwhoos."""
+    if not clan_tags: 
+        return
+        
+    headers = {'Authorization': f'Bearer {COC_TOKEN}'}
+    superwhoo_data = await load_json_file(SUPERWHOO_FILE, {})
+    
+    for c_tag in clan_tags:
+        c_tag_clean = c_tag.replace('#', '%23')
+        
+        status, war = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{c_tag_clean}/currentwar", headers)
+        if status == 200 and war and war.get('state') != 'notInWar':
+            process_war_data(war, superwhoo_data, clan_tags, tracked_players)
+            
+        await asyncio.sleep(0.1) 
+        
+        status, cwl_group = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{c_tag_clean}/currentwar/leaguegroup", headers)
+        if status == 200 and cwl_group and cwl_group.get('state') != 'ended':
+            for round_data in cwl_group.get('rounds', []):
+                for war_tag in round_data.get('warTags', []):
+                    if war_tag != "#0":  
+                        w_status, cwl_war = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clanwarleagues/wars/{war_tag.replace('#', '%23')}", headers)
+                        if w_status == 200 and cwl_war:
+                            if cwl_war.get('clan', {}).get('tag') == c_tag or cwl_war.get('opponent', {}).get('tag') == c_tag:
+                                process_war_data(cwl_war, superwhoo_data, clan_tags, tracked_players)
+                        await asyncio.sleep(0.1)
+                        
+    await save_json_file(SUPERWHOO_FILE, superwhoo_data)
+
+
 # --- LEADERBOARD BUILDER ---
 async def build_leaderboard_embeds(bot):
     players = await load_json_file(PLAYERS_FILE, [])
@@ -349,13 +451,15 @@ async def build_leaderboard_embeds(bot):
         )
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="Page 1/1 | Last Refreshed")
-        return [embed]
+        return [embed], set(), [] 
 
     trophy_cache = await load_json_file(TROPHY_CACHE_FILE, {})
     legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
+    name_cache = await load_json_file(NAME_CACHE_FILE, {}) 
     
     new_cache = {}
     data_list = []
+    unique_clans = set()
     headers = {'Authorization': f'Bearer {COC_TOKEN}'}
     
     semaphore = asyncio.Semaphore(3)
@@ -363,13 +467,20 @@ async def build_leaderboard_embeds(bot):
     fetch_tasks = [fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, semaphore) for tag in players]
     results = await asyncio.gather(*fetch_tasks)
 
-    for player_dict, tag, current_trophies, _ in results:
+    for player_dict, tag, current_trophies, raw_data in results:
         if player_dict:
             data_list.append(player_dict)
             new_cache[tag] = current_trophies
+            
+            if raw_data and raw_data.get('clan'):
+                unique_clans.add(raw_data['clan']['tag'])
+                
+            if raw_data and raw_data.get('name'):
+                name_cache[tag] = raw_data.get('name')
 
     await save_json_file(TROPHY_CACHE_FILE, new_cache)
     await save_json_file(LEGEND_STATS_FILE, legend_stats_cache) 
+    await save_json_file(NAME_CACHE_FILE, name_cache) 
 
     data_list.sort(key=lambda x: (x['league_weight'], x['trophies']), reverse=True)
 
@@ -382,7 +493,6 @@ async def build_leaderboard_embeds(bot):
         desc = ""
         for j, p in enumerate(chunk, start=i + 1):
             
-            # --- TRUE VISUAL COLUMN SYSTEM WITH YOUR ORIGINAL LAYOUT ---
             rank_str = f"{j}.".ljust(3)
             display_name = format_name_strict(p['name'], 10)
             trophies_str = f"{p['trophies']:>4}"
@@ -420,7 +530,7 @@ async def build_leaderboard_embeds(bot):
         embed.set_footer(text=f"Page {current_page}/{total_pages} | Last Refreshed")
         embeds.append(embed)
 
-    return embeds
+    return embeds, unique_clans, players
 
 # --- INTERACTIVE VIEW ---
 class LeaderboardView(discord.ui.View):
@@ -438,7 +548,8 @@ class LeaderboardView(discord.ui.View):
     async def ensure_embeds(self, interaction: discord.Interaction):
         if not self.embeds:
             await interaction.response.defer()
-            self.embeds = await build_leaderboard_embeds(self.bot)
+            self.embeds, unique_clans, tracked_players = await build_leaderboard_embeds(self.bot)
+            self.bot.loop.create_task(process_clan_wars(self.bot, unique_clans, tracked_players))
             
             try:
                 original_msg = await interaction.channel.fetch_message(interaction.message.id)
@@ -501,7 +612,8 @@ class LeaderboardView(discord.ui.View):
         await interaction.response.edit_message(embed=loading_embed, view=self)
         
         self.bot.last_refresh_time = current_time
-        new_embeds = await build_leaderboard_embeds(self.bot)
+        new_embeds, unique_clans, tracked_players = await build_leaderboard_embeds(self.bot)
+        self.bot.loop.create_task(process_clan_wars(self.bot, unique_clans, tracked_players))
         
         self.embeds = new_embeds
         self.current_page = min(self.current_page, len(self.embeds) - 1)
@@ -585,7 +697,10 @@ async def auto_update_leaderboard():
     if channel:
         try:
             message = await channel.fetch_message(message_id)
-            embeds = await build_leaderboard_embeds(bot)
+            embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
+            
+            bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
+            
             bot.last_refresh_time = time.time()
 
             current = bot.lb_pages.get(message_id, 0)
@@ -620,7 +735,9 @@ async def set_leaderboard(interaction: discord.Interaction):
             except Exception:
                 pass
 
-    embeds = await build_leaderboard_embeds(bot)
+    embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
+    bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
+    
     bot.last_refresh_time = time.time()
     
     view = LeaderboardView(bot, embeds)
@@ -654,6 +771,11 @@ async def add_player(interaction: discord.Interaction, player_tag: str):
         if clean_tag not in players:
             players.append(clean_tag)
             await save_json_file(PLAYERS_FILE, players)
+            
+            name_cache = await load_json_file(NAME_CACHE_FILE, {})
+            name_cache[clean_tag] = data.get('name', 'Unknown')
+            await save_json_file(NAME_CACHE_FILE, name_cache)
+            
             await interaction.followup.send(f"✅ Added **{data.get('name')}** to the server tracker!")
         else:
             await interaction.followup.send("⚠️ Player is already in the server tracker.")
@@ -678,16 +800,19 @@ async def add_clan(interaction: discord.Interaction, clan_tag: str):
         clan_name = data.get('name', 'Unknown Clan')
 
         players = await load_json_file(PLAYERS_FILE, [])
+        name_cache = await load_json_file(NAME_CACHE_FILE, {})
         added_count = 0
 
         for member in members:
             member_tag = member.get('tag', '').lstrip('#').upper()
             if member_tag and member_tag not in players:
                 players.append(member_tag)
+                name_cache[member_tag] = member.get('name', 'Unknown')
                 added_count += 1
 
         if added_count > 0:
             await save_json_file(PLAYERS_FILE, players)
+            await save_json_file(NAME_CACHE_FILE, name_cache)
             await interaction.followup.send(f"✅ Successfully added **{added_count}** new members from **{clan_name}** to the server tracker!")
         else:
             await interaction.followup.send(f"⚠️ All members of **{clan_name}** are already in the tracker.")
@@ -696,18 +821,23 @@ async def add_clan(interaction: discord.Interaction, clan_tag: str):
 
 
 @bot.tree.command(name='remove', description="Remove a player from the server tracker.")
-@app_commands.describe(player_tag="The in-game tag of the player (with or without #)")
+@app_commands.describe(player="Search by Player Name or Tag")
+@app_commands.autocomplete(player=player_autocomplete)
 @is_admin_or_owner()
-async def remove_player(interaction: discord.Interaction, player_tag: str):
+async def remove_player(interaction: discord.Interaction, player: str):
     await interaction.response.defer(ephemeral=True)
 
-    clean_tag = player_tag.strip().lstrip('#').upper()
+    target_tag = await resolve_player_input(player)
+    if not target_tag:
+        await interaction.followup.send("❌ Please provide a valid player name or tag.")
+        return
+
     players = await load_json_file(PLAYERS_FILE, [])
 
-    if clean_tag in players:
-        players.remove(clean_tag)
+    if target_tag in players:
+        players.remove(target_tag)
         await save_json_file(PLAYERS_FILE, players)
-        await interaction.followup.send(f"🗑️ Removed **#{clean_tag}** from the server tracker.")
+        await interaction.followup.send(f"🗑️ Removed **#{target_tag}** from the server tracker.")
     else:
         await interaction.followup.send("⚠️ Player is not currently in the server tracker.")
 
@@ -724,7 +854,9 @@ async def command_leaderboard(interaction: discord.Interaction):
         except Exception:
             pass
 
-    embeds = await build_leaderboard_embeds(bot)
+    embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
+    bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
+    
     bot.last_refresh_time = time.time()
     
     view = LeaderboardView(bot, embeds)
@@ -746,16 +878,21 @@ async def command_leaderboard_error(interaction: discord.Interaction, error: app
 
 
 @bot.tree.command(name='profile', description="Look up a specific Clash of Clans player profile.")
-@app_commands.describe(player_tag="The in-game tag of the player (with or without #)")
-async def player_profile(interaction: discord.Interaction, player_tag: str):
+@app_commands.describe(player="Search by Player Name or Tag")
+@app_commands.autocomplete(player=player_autocomplete)
+async def player_profile(interaction: discord.Interaction, player: str):
     await interaction.response.defer()
 
-    clean_tag = player_tag.strip().lstrip('#').upper()
+    target_tag = await resolve_player_input(player)
+    if not target_tag:
+        await interaction.followup.send("❌ Please provide a valid player name or tag.")
+        return
+
     headers = {'Authorization': f'Bearer {COC_TOKEN}'}
     
     legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
     player_dict, _, _, raw_data = await fetch_player_data(
-        interaction.client.session, clean_tag, headers, {}, legend_stats_cache, semaphore=None
+        interaction.client.session, target_tag, headers, {}, legend_stats_cache, semaphore=None
     )
     await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
 
@@ -763,18 +900,120 @@ async def player_profile(interaction: discord.Interaction, player_tag: str):
         clan = raw_data.get('clan', {}).get('name', 'No Clan')
         role = raw_data.get('role', 'Member').capitalize() if raw_data.get('clan') else 'N/A'
         
-        profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={clean_tag}"
+        profile_url = f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={target_tag}"
+        
+        formatted_tag = f"#{target_tag}"
+        superwhoo_data = await load_json_file(SUPERWHOO_FILE, {})
+        sw_count = superwhoo_data.get(formatted_tag, {}).get("count", 0)
 
         embed = discord.Embed(title=f"{player_dict['emoji']} {raw_data.get('name')} (TH{player_dict['th']})", url=profile_url, color=discord.Color.blue())
         embed.add_field(name="Clan", value=f"{clan} ({role})", inline=False)
         embed.add_field(name="Trophies", value=f"{TROPHY_EMOJI} {raw_data.get('trophies')} (Best: {raw_data.get('bestTrophies')})", inline=True)
         embed.add_field(name="War Stars", value=f"⭐ {raw_data.get('warStars')}", inline=True)
         embed.add_field(name="Attacks Won", value=f"⚔️ {raw_data.get('attackWins')}", inline=True)
-        embed.set_footer(text=f"Tag: #{clean_tag}")
+        embed.add_field(name="Superwhoo Fails", value=f"💔 {sw_count}", inline=True)
+        embed.set_footer(text=f"Tag: #{target_tag}")
 
         await interaction.followup.send(embed=embed)
     else:
         await interaction.followup.send("❌ Could not find that player, or the API is currently unavailable.")
+
+
+@bot.tree.command(name='superwhoo', description="Shows the leaderboard or a specific player's 97-99% attack fails!")
+@app_commands.describe(player="Optional: Search by Player Name or Tag to see their specific fail history.")
+@app_commands.autocomplete(player=player_autocomplete)
+async def command_superwhoo(interaction: discord.Interaction, player: str = None):
+    await interaction.response.defer()
+    
+    superwhoo_data = await load_json_file(SUPERWHOO_FILE, {})
+    
+    if not superwhoo_data:
+        await interaction.followup.send("🏆 The Superwhoo Leaderboard is currently empty. No painful misses yet!")
+        return
+
+    # --- SHOW SPECIFIC PLAYER'S HISTORY ---
+    if player:
+        target_tag = await resolve_player_input(player)
+        if not target_tag:
+            await interaction.followup.send("❌ Please provide a valid player name or tag.")
+            return
+            
+        clean_tag = f"#{target_tag}"
+        player_data = superwhoo_data.get(clean_tag)
+
+        if not player_data or player_data['count'] == 0:
+            name_cache = await load_json_file(NAME_CACHE_FILE, {})
+            display_name = name_cache.get(target_tag, clean_tag)
+            await interaction.followup.send(f"✅ Great news! **{display_name}** has no recorded 97-99% fails.")
+            return
+
+        embed = discord.Embed(
+            title=f"💔 {player_data['name']}'s Superwhoo History",
+            color=discord.Color.red()
+        )
+
+        history_text = ""
+        for sig in reversed(player_data['seen']):
+            parts = sig.split('_')
+            if len(parts) >= 3:
+                end_time = parts[0]
+                
+                if len(parts) >= 6:
+                    stars = parts[4]
+                    dest = f"{parts[5]}%"
+                else:
+                    stars = "?"
+                    dest = "97-99%"
+
+                try:
+                    dt = datetime.datetime.strptime(end_time, "%Y%m%dT%H%M%S.000Z")
+                    time_str = dt.strftime("%b %d, %Y")
+                except ValueError:
+                    time_str = "Unknown Date"
+
+                history_text += f"• **{dest}** ({stars}⭐) *(War Ended: {time_str})*\n"
+
+        if len(history_text) > 4000:
+            history_text = history_text[:4000] + "...\n*(Showing latest 50)*"
+
+        embed.add_field(name=f"Total Fails: {player_data['count']}", value=history_text, inline=False)
+        await interaction.followup.send(embed=embed)
+        return
+
+    # --- SHOW THE GLOBAL LEADERBOARD ---
+    lb = []
+    for tag, data in superwhoo_data.items():
+        if data['count'] > 0:
+            lb.append({"name": data['name'], "count": data['count']})
+            
+    lb.sort(key=lambda x: x['count'], reverse=True)
+    
+    if not lb:
+        await interaction.followup.send("🏆 The Superwhoo Leaderboard is currently empty. No painful misses yet!")
+        return
+
+    embed = discord.Embed(
+        title="🏆 The Superwhoo Leaderboard 🏆",
+        description="The ultimate wall of shame for 97-99% war attacks (Normal & CWL).",
+        color=discord.Color.red()
+    )
+    
+    desc_text = ""
+    for idx, ranked_player in enumerate(lb[:50], 1): 
+        if idx == 1:
+            prefix = "🥇"
+        elif idx == 2:
+            prefix = "🥈"
+        elif idx == 3:
+            prefix = "🥉"
+        else:
+            prefix = f"`{idx}.`"
+            
+        desc_text += f"{prefix} **{ranked_player['name']}** - {ranked_player['count']} Superwhoos\n"
+        
+    embed.add_field(name="Rankings", value=desc_text, inline=False)
+    await interaction.followup.send(embed=embed)
+
 
 # --- CUSTOM COMMANDS MANAGEMENT ---
 
