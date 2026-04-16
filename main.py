@@ -43,7 +43,7 @@ TROOP_EMOJIS = {
     0: "<:Avatar_Barbarian:1493123027486117978>", 1: "<:Avatar_Archer:1493123099598655639>", 2: "goblin", 3: "giant", 4: "wallbreaker", 5: "balloon",
     6: "wizard", 7: "healer", 8: "dragon", 9: "pekka", 10: "<:Avatar_Minion:1493123172822810674> ", 11: "hogrider", 12: "valkyrie", 13: "golem",
     15: "witch", 17: "<:Avatar_Lava_Hound:1493123323939262604>", 22: "bowler", 23: "<:Avatar_Baby_Dragon:1493123145526280202>", 24: "miner",
-    26: "superbarbarian", 27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 53: "yeti", 57: "<:Avatar_Super_Minion:1493879940100132894>",
+    26: "superbarbarian", 27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 53: "yeti", 57: "<:Avatar_Rocket_Balloon:1493123292763000943>",
     58: "icegolem", 59: "electrodragon", 62: "stoneslammer", 63: "<:Avatar_Inferno_Dragon:1493123215545995335>", 65: "<:Avatar_Dragon_Rider:1493122980795125931>",
     66: "troop66", 75: "<:Avatar_Siege_Barracks:1493245189450633397> ", 80: "<:Avatar_Rocket_Balloon:1493123292763000943> ", 82: "headhunter",
     87: "loglauncher", 91: "flameflinger", 92: "battledrill", 95: "electrotitan", 97: "apprenticewarden", 110: "rootrider", 132: "thrower",
@@ -52,8 +52,7 @@ TROOP_EMOJIS = {
 
 SPELL_EMOJIS = {
     0: "lightning", 1: "heal", 2: "rage", 3: "jump", 4: "spell4", 5: "<:Freeze_Spell_info:1493245284740894921>", 7: "earthquake", 8: "haste",
-    9: "<:Poison_Spell_info:1493245348628664600>", 10: "bat", 11: "invisibility", 17: "<:Skeleton_Spell_info:1493865965153423501>", 70: "<:Overgrowth_Spell_info:1493245378483454052>",
-    98: "<:Revive_Spell_info:1493245315405447218>", 120: "<:Totem_Spell_info:1493245251270348992>"
+    9: "<:Poison_Spell_info:1493245348628664600>", 10: "bat", 11: "invisibility", 17: "<:Skeleton_Spell_info:1493865965153423501>", 70: "<:Overgrowth_Spell_info:1493245378483454052>", 98: "<:Revive_Spell_info:1493245315405447218>", 120: "<:Totem_Spell_info:1493245251270348992>"
 }
 
 HEROES = {
@@ -62,7 +61,7 @@ HEROES = {
 }
 
 PETS = {
-    0: "L.A.S.S.I", 1: "Mighty Yak", 2: "Electro Owl", 3: "Unicorn", 
+    0: "L.A.S.S.I", 1: "Mighty Yak", 2: "Electro Owl", 3: "Unicorn", 6: "<:Avatar_Phoenix:1493876190396678235>",
     7: "Poison Lizard", 8: "Diggy", 9: "<:Avatar_Frosty:1493876156691120148>", 10: "Spirit Fox", 11: "<:Avatar_Angry_Jelly:1493876225159073812> "
 }
 
@@ -380,7 +379,7 @@ async def build_leaderboard_embeds(bot):
 
     return embeds, unique_clans, players
 
-# --- INTERACTIVE VIEW ---
+# --- INTERACTIVE VIEWS ---
 class LeaderboardView(discord.ui.View):
     def __init__(self, bot, embeds=None, current_page=0, message_id=None):
         super().__init__(timeout=None)
@@ -434,6 +433,31 @@ class LeaderboardView(discord.ui.View):
         await self.ensure_embeds(interaction); self.current_page = min(len(self.embeds) - 1, self.current_page + 1)
         self.update_buttons(); self.save_state(interaction)
         await (interaction.edit_original_response if interaction.response.is_done() else interaction.response.edit_message)(embed=self.embeds[self.current_page], view=self)
+
+
+class ArmiesPaginator(discord.ui.View):
+    def __init__(self, embeds):
+        super().__init__(timeout=300)
+        self.embeds = embeds
+        self.current_page = 0
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page == len(self.embeds) - 1
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="armies_prev")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="armies_next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = min(len(self.embeds) - 1, self.current_page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
 
 # --- BOT CLASS & SETUP ---
 class CoCBot(commands.Bot):
@@ -586,10 +610,14 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
     if target_tag in armies_db and "armies" in armies_db[target_tag]:
         armies_db[target_tag]["ranked"] = armies_db[target_tag].pop("armies"); armies_db[target_tag].setdefault("unranked", {})
             
-    has_tracked, armies_to_show, title_prefix = target_tag in armies_db and armies_db[target_tag].get(mode), {}, ""
+    has_tracked = target_tag in armies_db and armies_db[target_tag].get(mode)
+    armies_to_show = {}
+    title_prefix = ""
     
     if has_tracked:
-        armies_to_show, title_prefix, display_name = armies_db[target_tag][mode], "All-Time Tracked", (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f"#{target_tag}")
+        armies_to_show = armies_db[target_tag][mode]
+        title_prefix = "All-Time Tracked"
+        display_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f"#{target_tag}")
     else:
         status, log_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", {'Authorization': f'Bearer {COC_TOKEN}'})
         if status == 403: return await interaction.followup.send("🔒 This player's battle log is private.")
@@ -606,12 +634,36 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
         
     if not armies_to_show: return await interaction.followup.send(f"⚠️ No **{mode}** armies found for this player in their recent log.")
         
-    sorted_armies = sorted(armies_to_show.items(), key=lambda x: x[1]['uses'], reverse=True)
-    embed = discord.Embed(title=f"⚔️ {title_prefix} {'Ranked' if mode == 'ranked' else 'Unranked (War/Friendly)'} Armies for {display_name}", color=discord.Color.brand_green() if mode == "ranked" else discord.Color.orange())
+    sorted_armies = sorted(armies_to_show.items(), key=lambda x: x[1]['uses'], reverse=True)[:15]  # Cap at top 15 armies
+    embeds = []
     
-    for i, (code, stats) in enumerate(sorted_armies[:5]):
-        embed.add_field(name=f"Army {i+1} (Used {stats['uses']} times)", value=f"**Avg Destruction:** {stats['total_dest'] / stats['uses']:.1f}%\n**Composition:** {get_army_summary(code)}\n[🔗 Click to Copy Army In-Game](https://link.clashofclans.com/en?action=CopyArmy&army={code})", inline=False)
-    await interaction.followup.send(embed=embed)
+    color = discord.Color.brand_green() if mode == "ranked" else discord.Color.orange()
+    main_title = f"⚔️ {title_prefix} {'Ranked' if mode == 'ranked' else 'Unranked (War/Friendly)'} Armies for {display_name}"
+    
+    for i, (code, stats) in enumerate(sorted_armies):
+        embed = discord.Embed(title=main_title, color=color)
+        comp = get_army_summary(code)
+        
+        # Bypassing the 1024 field limit by using the 4096 character description limit
+        desc_text = (
+            f"**Army {i+1}** (Used {stats['uses']} times)\n"
+            f"**Avg Destruction:** {stats['total_dest'] / stats['uses']:.1f}%\n\n"
+            f"**Composition:**\n{comp}\n\n"
+            f"[🔗 Click to Copy Army In-Game](https://link.clashofclans.com/en?action=CopyArmy&army={code})"
+        )
+        
+        if len(desc_text) > 4096:
+            desc_text = desc_text[:4090] + "..."
+            
+        embed.description = desc_text
+        embed.set_footer(text=f"Page {i+1} of {len(sorted_armies)}")
+        embeds.append(embed)
+
+    if len(embeds) > 1:
+        view = ArmiesPaginator(embeds)
+        await interaction.followup.send(embed=embeds[0], view=view)
+    else:
+        await interaction.followup.send(embed=embeds[0])
 
 @bot.tree.command(name='superwhoo', description="Shows the leaderboard or a specific player's 97-99% attack fails!")
 @app_commands.autocomplete(player=player_autocomplete)
