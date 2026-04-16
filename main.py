@@ -43,7 +43,7 @@ TROOP_EMOJIS = {
     0: "<:Avatar_Barbarian:1493123027486117978>", 1: "<:Avatar_Archer:1493123099598655639>", 2: "goblin", 3: "giant", 4: "wallbreaker", 5: "balloon",
     6: "wizard", 7: "healer", 8: "dragon", 9: "pekka", 10: "<:Avatar_Minion:1493123172822810674> ", 11: "hogrider", 12: "valkyrie", 13: "golem",
     15: "witch", 17: "<:Avatar_Lava_Hound:1493123323939262604>", 22: "bowler", 23: "<:Avatar_Baby_Dragon:1493123145526280202>", 24: "miner",
-    26: "superbarbarian", 27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 53: "yeti", 57: "superminions",
+    26: "superbarbarian", 27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 53: "yeti", 57: "<:Avatar_Super_Minion:1493879940100132894>",
     58: "icegolem", 59: "electrodragon", 62: "stoneslammer", 63: "<:Avatar_Inferno_Dragon:1493123215545995335>", 65: "<:Avatar_Dragon_Rider:1493122980795125931>",
     66: "troop66", 75: "<:Avatar_Siege_Barracks:1493245189450633397> ", 80: "<:Avatar_Rocket_Balloon:1493123292763000943> ", 82: "headhunter",
     87: "loglauncher", 91: "flameflinger", 92: "battledrill", 95: "electrotitan", 97: "apprenticewarden", 110: "rootrider", 132: "thrower",
@@ -52,8 +52,18 @@ TROOP_EMOJIS = {
 
 SPELL_EMOJIS = {
     0: "lightning", 1: "heal", 2: "rage", 3: "jump", 4: "spell4", 5: "<:Freeze_Spell_info:1493245284740894921>", 7: "earthquake", 8: "haste",
-    9: "<:Poison_Spell_info:1493245348628664600>", 10: "bat", 11: "invisibility", 17: "skeleton_spell", 70: "<:Overgrowth_Spell_info:1493245378483454052>",
+    9: "<:Poison_Spell_info:1493245348628664600>", 10: "bat", 11: "invisibility", 17: "<:Skeleton_Spell_info:1493865965153423501>", 70: "<:Overgrowth_Spell_info:1493245378483454052>",
     98: "<:Revive_Spell_info:1493245315405447218>", 120: "<:Totem_Spell_info:1493245251270348992>"
+}
+
+HEROES = {
+    0: "Barbarian King", 1: "<:Avatar_Hero_Archer_Queen:1493875811319681055>", 2: "<:Avatar_Hero_Grand_Warden:1493875923357794324>", 
+    4: "Royal Champion", 6: "Minion Prince", 7: "<:Avatar_Hero_Dragon_Duke:1493875886921879623>"
+}
+
+PETS = {
+    0: "L.A.S.S.I", 1: "Mighty Yak", 2: "Electro Owl", 3: "Unicorn", 
+    7: "Poison Lizard", 8: "Diggy", 9: "<:Avatar_Frosty:1493876156691120148>", 10: "Spirit Fox", 11: "<:Avatar_Angry_Jelly:1493876225159073812> "
 }
 
 TIER_ID_TO_NAME = {
@@ -115,18 +125,71 @@ get_league_emoji = lambda l: LEAGUE_EMOJIS.get(l, "➖")
 get_league_weight = lambda l: LEAGUE_WEIGHTS.get(l, 0)
 get_battle_sig = lambda b: f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}"
 
+
+SNEEZY_DISPLAY = "<:Avatar_Sneezy:1493876254443835432>"
+
 def get_army_summary(share_code: str) -> str:
-    units, spells = [], []
-    u_match, s_match = re.search(r'u([\d\-x]+)', share_code), re.search(r's([\d\-x]+)', share_code)
-    
+    units, spells, hero_pets = [], [], []
+    u_match = re.search(r'u([\d\-x]+)', share_code)
+    s_match = re.search(r's([\d\-x]+)', share_code)
+
     if u_match:
-        for i in u_match.group(1).split('-'):
-            if 'x' in i: qty, u_id = i.split('x'); units.append(f"{qty}x{TROOP_EMOJIS.get(int(u_id), f'unit{u_id}')}")
+        u_items = u_match.group(1).split('-')
+        consumed = set()
+
+        # STEP 1: Find Warden first, assign pet or default to Sneezy
+        for idx, item in enumerate(u_items):
+            if 'x' not in item:
+                continue
+            qty, u_id = map(int, item.split('x'))
+            if qty == 1 and u_id == 2:  # 2 = Grand Warden
+                consumed.add(idx)
+                next_idx = idx + 1
+                if next_idx < len(u_items) and 'x' in u_items[next_idx]:
+                    n_qty, n_id = map(int, u_items[next_idx].split('x'))
+                    if n_qty == 1 and n_id in PETS:
+                        hero_pets.insert(0, f"{HEROES[2]} & {PETS[n_id]}")
+                        consumed.add(next_idx)
+                    else:
+                        hero_pets.insert(0, f"{HEROES[2]} & {SNEEZY_DISPLAY}")
+                else:
+                    hero_pets.insert(0, f"{HEROES[2]} & {SNEEZY_DISPLAY}")
+                break
+
+        # STEP 2: Process troops, then remaining heroes+pets (skip Warden's consumed indices)
+        combo_count = len(hero_pets)
+        skip_next = False
+
+        for idx, item in enumerate(u_items):
+            if idx in consumed:
+                continue
+            if skip_next:
+                skip_next = False
+                continue
+            if 'x' not in item:
+                continue
+            qty, u_id = map(int, item.split('x'))
+
+            if qty == 1 and u_id in HEROES and combo_count < 4:
+                next_idx = idx + 1
+                if next_idx < len(u_items) and 'x' in u_items[next_idx] and next_idx not in consumed:
+                    n_qty, n_id = map(int, u_items[next_idx].split('x'))
+                    if n_qty == 1 and n_id in PETS:
+                        hero_pets.append(f"{HEROES[u_id]} & {PETS[n_id]}")
+                        skip_next = True
+                        combo_count += 1
+                        continue
+
+            units.append(f"{qty}x{TROOP_EMOJIS.get(u_id, f'unit{u_id}')}")
+
     if s_match:
-        for i in s_match.group(1).split('-'):
-            if 'x' in i: qty, s_id = i.split('x'); spells.append(f"{qty}x{SPELL_EMOJIS.get(int(s_id), f'spell{s_id}')}")
-            
-    return " | ".join(filter(None, [" ".join(units), " ".join(spells)])) or "unknowntroops"
+        for item in s_match.group(1).split('-'):
+            if 'x' in item:
+                qty, s_id = map(int, item.split('x'))
+                spells.append(f"{qty}x{SPELL_EMOJIS.get(s_id, f'spell{s_id}')}")
+
+    # Output: Troops | Spells | Warden first, then other hero+pets
+    return " | ".join(filter(None, [" ".join(units), " ".join(spells), " ".join(hero_pets)])) or "unknowntroops"
 
 def is_admin_or_owner():
     def predicate(interaction: discord.Interaction):
