@@ -124,10 +124,10 @@ get_league_emoji = lambda l: LEAGUE_EMOJIS.get(l, "➖")
 get_league_weight = lambda l: LEAGUE_WEIGHTS.get(l, 0)
 get_battle_sig = lambda b: f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}"
 
-
 SNEEZY_DISPLAY = "<:Avatar_Sneezy:1493876254443835432>"
 
 def get_army_summary(share_code: str) -> str:
+    if not share_code: return "Unknown Troops"
     units, spells, hero_pets = [], [], []
     u_match = re.search(r'u([\d\-x]+)', share_code)
     s_match = re.search(r's([\d\-x]+)', share_code)
@@ -155,7 +155,7 @@ def get_army_summary(share_code: str) -> str:
                     hero_pets.insert(0, f"{HEROES[2]} & {SNEEZY_DISPLAY}")
                 break
 
-        # STEP 2: Process troops, then remaining heroes+pets (skip Warden's consumed indices)
+        # STEP 2: Process troops, then remaining heroes+pets
         combo_count = len(hero_pets)
         skip_next = False
 
@@ -187,7 +187,6 @@ def get_army_summary(share_code: str) -> str:
                 qty, s_id = map(int, item.split('x'))
                 spells.append(f"{qty}x{SPELL_EMOJIS.get(s_id, f'spell{s_id}')}")
 
-    # Output: Troops | Spells | Warden first, then other hero+pets
     return " | ".join(filter(None, [" ".join(units), " ".join(spells), " ".join(hero_pets)])) or "unknowntroops"
 
 def is_admin_or_owner():
@@ -434,8 +433,8 @@ class LeaderboardView(discord.ui.View):
         self.update_buttons(); self.save_state(interaction)
         await (interaction.edit_original_response if interaction.response.is_done() else interaction.response.edit_message)(embed=self.embeds[self.current_page], view=self)
 
-
-class ArmiesPaginator(discord.ui.View):
+# Generic paginator that we can reuse for both Armies and Battle Logs
+class EmbedPaginator(discord.ui.View):
     def __init__(self, embeds):
         super().__init__(timeout=300)
         self.embeds = embeds
@@ -446,13 +445,13 @@ class ArmiesPaginator(discord.ui.View):
         self.prev_button.disabled = self.current_page == 0
         self.next_button.disabled = self.current_page == len(self.embeds) - 1
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="armies_prev")
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="page_prev")
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = max(0, self.current_page - 1)
         self.update_buttons()
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="armies_next")
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="page_next")
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = min(len(self.embeds) - 1, self.current_page + 1)
         self.update_buttons()
@@ -644,7 +643,6 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
         embed = discord.Embed(title=main_title, color=color)
         comp = get_army_summary(code)
         
-        # Bypassing the 1024 field limit by using the 4096 character description limit
         desc_text = (
             f"**Army {i+1}** (Used {stats['uses']} times)\n"
             f"**Avg Destruction:** {stats['total_dest'] / stats['uses']:.1f}%\n\n"
@@ -660,10 +658,106 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
         embeds.append(embed)
 
     if len(embeds) > 1:
-        view = ArmiesPaginator(embeds)
+        view = EmbedPaginator(embeds) # Swapped to the new generic paginator!
         await interaction.followup.send(embed=embeds[0], view=view)
     else:
         await interaction.followup.send(embed=embeds[0])
+
+
+# --- BATTLE LOG COMMAND ---
+@bot.tree.command(name='battle_log', description="View recent offensive and defensive battle logs for a player.")
+@app_commands.autocomplete(player=player_autocomplete)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Ranked (Legend Only)", value="ranked"),
+    app_commands.Choice(name="Unranked", value="unranked")
+])
+async def command_battle_log(interaction: discord.Interaction, player: str, mode: str = "ranked"):
+    await interaction.response.defer()
+    
+    if not (target_tag := await resolve_player_input(player)):
+        return await interaction.followup.send("❌ Please provide a valid player name or tag.")
+
+    status, log_data = await safe_fetch(
+        interaction.client.session, 
+        f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", 
+        {'Authorization': f'Bearer {COC_TOKEN}'}
+    )
+    
+    if status == 403: 
+        return await interaction.followup.send("🔒 This player's battle log is private.")
+    if status != 200 or not log_data or 'items' not in log_data: 
+        return await interaction.followup.send("❌ Could not fetch the battle log or the log is empty.")
+
+    display_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f"#{target_tag}")
+    
+    offenses = []
+    defenses = []
+    
+    for b in log_data.get('items', []):
+        is_ranked = b.get('battleType') == 'legend'
+        
+        if (mode == "ranked" and not is_ranked) or (mode == "unranked" and is_ranked):
+            continue
+
+        time_str = "Unknown Date"
+        if 'battleTime' in b:
+            try:
+                time_str = datetime.datetime.strptime(b['battleTime'].split('.')[0], "%Y%m%dT%H%M%S").strftime("%b %d, %H:%M")
+            except:
+                pass
+        
+        dest = b.get('destructionPercentage', 0)
+        stars = b.get('stars', 0)
+        is_attack = b.get('attack', False)
+        army_code = b.get('armyShareCode')
+        
+        army_text = get_army_summary(army_code) if army_code else "Unknown / Not Exposed by API"
+
+        entry = f"**Date:** {time_str} | **Result:** {dest}% | {stars} ⭐\n**Army:** {army_text}\n"
+        
+        if is_attack:
+            offenses.append(entry)
+        else:
+            defenses.append(entry)
+
+    # Safety limits: 2 per page prevents massive discord emoji strings from overflowing the 1024 limit
+    chunk_size = 2
+    max_len = max(len(offenses), len(defenses))
+    
+    if max_len == 0:
+        return await interaction.followup.send(f"⚠️ No recent {mode} records found in the API log.")
+
+    total_pages = max(1, (max_len + chunk_size - 1) // chunk_size)
+    embeds = []
+
+    for i in range(total_pages):
+        embed = discord.Embed(
+            title=f"{'🏆 Legend League' if mode == 'ranked' else '⚔️ Unranked'} Battle Log: {display_name}", 
+            color=discord.Color.dark_gray() if mode == 'unranked' else discord.Color.brand_green()
+        )
+        
+        off_chunk = offenses[i * chunk_size : (i + 1) * chunk_size]
+        def_chunk = defenses[i * chunk_size : (i + 1) * chunk_size]
+
+        offense_value = "\n---\n".join(off_chunk) if off_chunk else "No offensive records on this page."
+        defense_value = "\n---\n".join(def_chunk) if def_chunk else "No defensive records on this page."
+
+        # Final failsafe truncations
+        if len(offense_value) > 1024: offense_value = offense_value[:1020] + "..."
+        if len(defense_value) > 1024: defense_value = defense_value[:1020] + "..."
+
+        embed.add_field(name="⚔️ Offenses", value=offense_value, inline=False)
+        embed.add_field(name="🛡️ Defenses", value=defense_value, inline=False)
+        embed.set_footer(text=f"Page {i+1} of {total_pages} | Tag: #{target_tag}")
+        
+        embeds.append(embed)
+
+    if len(embeds) > 1:
+        view = EmbedPaginator(embeds)
+        await interaction.followup.send(embed=embeds[0], view=view)
+    else:
+        await interaction.followup.send(embed=embeds[0])
+
 
 @bot.tree.command(name='superwhoo', description="Shows the leaderboard or a specific player's 97-99% attack fails!")
 @app_commands.autocomplete(player=player_autocomplete)
