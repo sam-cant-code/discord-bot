@@ -341,9 +341,9 @@ async def process_clan_wars(bot, clan_tags, tracked_players):
 async def build_leaderboard_embeds(bot):
     players = await load_json_file(PLAYERS_FILE, [])
     if not players:
-        embed = discord.Embed(title=f"{TROPHY_EMOJI} Server Leaderboard {TROPHY_EMOJI}", description="The server leaderboard is empty. Ask an admin to use `/add` or `/add_clan`.", color=discord.Color.gold())
+        embed = discord.Embed(title=f"Server Leaderboard", description="The server leaderboard is empty. Ask an admin to use `/add` or `/add_clan`.", color=discord.Color.gold())
         embed.timestamp = discord.utils.utcnow()
-        embed.set_footer(text="Page 1/1 | Last Refreshed")
+        embed.set_footer(text="Page 1/1 | Last Updated")
         return [embed], set(), [] 
 
     trophy_cache, legend_stats_cache, name_cache, armies_db = await asyncio.gather(
@@ -372,16 +372,17 @@ async def build_leaderboard_embeds(bot):
     for i in range(0, max(1, len(data_list)), chunk_size):
         desc = ""
         for j, p in enumerate(data_list[i:i + chunk_size], start=i + 1):
-            line = f"`{f'{j}.'.ljust(3)}`{p['emoji']} [**`{format_name_strict(p['name'], 10)}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})`|{p['trophies']:>4}`{TROPHY_EMOJI}"
+            # This is the line that was modified to bold the serial number and trophy count using ** around the backticks
+            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} [**`{format_name_strict(p['name'], 10)}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})**`|{p['trophies']:>4}`**{TROPHY_EMOJI}"
             if p.get('league_weight') == 34:
                 ll = p.get('legend_log')
                 if ll == "private": line += " | `🔒 Private`"
                 elif isinstance(ll, dict): line += f" | `+{ll['off_trophies']}{to_superscript(ll['off_count'])}".ljust(9) + f"|-{ll['def_trophies']}{to_superscript(ll['def_count'])}".ljust(7) + "`"
             desc += line + p['delta'] + "\n"
 
-        embed = discord.Embed(title=f"{TROPHY_EMOJI} Server Leaderboard {TROPHY_EMOJI}", description=desc, color=discord.Color.gold())
+        embed = discord.Embed(title=f"Server Leaderboard", description=desc, color=discord.Color.gold())
         embed.timestamp = discord.utils.utcnow()
-        embed.set_footer(text=f"Page {(i // chunk_size) + 1}/{total_pages} | Last Refreshed")
+        embed.set_footer(text=f"Page {(i // chunk_size) + 1}/{total_pages} | Last Updated")
         embeds.append(embed)
 
     return embeds, unique_clans, players
@@ -416,21 +417,6 @@ class LeaderboardView(discord.ui.View):
         await self.ensure_embeds(interaction); self.current_page = max(0, self.current_page - 1)
         self.update_buttons(); self.save_state(interaction)
         await (interaction.edit_original_response if interaction.response.is_done() else interaction.response.edit_message)(embed=self.embeds[self.current_page], view=self)
-
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.blurple, emoji="🔄", custom_id="refresh_lb_btn")
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if (current_time := time.time()) - self.bot.last_refresh_time < self.cooldown_seconds:
-            return await interaction.response.send_message(f"⏳ Please wait **{int(self.cooldown_seconds - (current_time - self.bot.last_refresh_time)) // 60}m {int(self.cooldown_seconds - (current_time - self.bot.last_refresh_time)) % 60}s** before refreshing again.", ephemeral=True)
-        loading_embed = self.embeds[self.current_page].copy() if self.embeds else discord.Embed(title=f"{TROPHY_EMOJI} Server Leaderboard {TROPHY_EMOJI}", color=discord.Color.gold())
-        loading_embed.set_footer(text="⏳ Fetching latest data from Clash of Clans API, please wait...")
-        for child in self.children: child.disabled = True
-        await interaction.response.edit_message(embed=loading_embed, view=self)
-        
-        self.embeds = await refresh_lb(self.bot)
-        self.current_page = min(self.current_page, len(self.embeds) - 1)
-        for child in self.children: child.disabled = False
-        self.update_buttons(); self.save_state(interaction)
-        await interaction.edit_original_response(embed=self.embeds[self.current_page], view=self)
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="lb_next_btn")
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -475,7 +461,6 @@ class BattleLogView(discord.ui.View):
         self.current_page = 0
         self.view_mode = "offense" if offenses else "defense"
         
-        # FIX: Lowering chunk_size prevents the string slice from breaking custom Discord emojis.
         self.chunk_size = 2  
         
         self.update_state()
@@ -545,11 +530,9 @@ class BattleLogView(discord.ui.View):
 
 class SelfRoleView(discord.ui.View):
     def __init__(self):
-        # Timeout must be None for persistent views
         super().__init__(timeout=None)
 
     async def handle_role(self, interaction: discord.Interaction, role_name: str):
-        # Find the role by exact name string
         role = discord.utils.get(interaction.guild.roles, name=role_name)
         if not role:
             return await interaction.response.send_message(f"❌ The role **{role_name}** could not be found in this server. Please create it first.", ephemeral=True)
@@ -579,7 +562,6 @@ class CoCBot(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.add_view(LeaderboardView(self))
-        # Register the persistent role view so it survives bot restarts
         self.add_view(SelfRoleView()) 
         await self.tree.sync()
         if not auto_update_leaderboard.is_running(): auto_update_leaderboard.start()
@@ -890,7 +872,6 @@ async def command_battle_log(interaction: discord.Interaction, player: str, mode
     if not offenses and not defenses:
         return await interaction.followup.send(f"⚠️ No recent {mode} records found in the API log.")
 
-    # Utilize the custom interactive toggle view!
     view = BattleLogView(offenses, defenses, display_name, target_tag, mode)
     await interaction.followup.send(embed=view.build_embed(), view=view)
 
