@@ -16,6 +16,7 @@ NAME_CACHE_FILE, ARMIES_DB_FILE = 'name_cache.json', 'armies_db.json'
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
 OWNER_ID = int(os.getenv('OWNER_ID', 0))
+COC_HEADERS = {'Authorization': f'Bearer {COC_TOKEN}'}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -107,6 +108,8 @@ async def player_autocomplete(interaction: discord.Interaction, current: str) ->
 
 # --- MATH & FORMATTING HELPERS ---
 def format_name_strict(name, max_width=10):
+    if name and name.lower() == "sam":
+        return "/Sam\\"
     safe_name = name.replace('`', "'")
     return (safe_name[:max_width - 2] + "..").ljust(max_width) if len(safe_name) > max_width else safe_name.ljust(max_width)
 
@@ -214,6 +217,13 @@ async def fetch_league_history(session, tag, headers):
         return TIER_ID_TO_NAME.get(sorted(hist['items'], key=lambda x: str(x.get('season', '')))[-1].get('leagueTierId', 0), "Unranked")
     return "Unranked"
 
+def migrate_armies(entry):
+    if 'armies' in entry:
+        entry['ranked'] = entry.pop('armies')
+    entry.setdefault('ranked', {})
+    entry.setdefault('unranked', {})
+    return entry
+
 async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, armies_db, semaphore=None):
     async with (semaphore or contextlib.nullcontext()):
         await asyncio.sleep(0.1)
@@ -236,9 +246,7 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                 
                 # Process Armies DB
                 if tag not in armies_db: armies_db[tag] = {"seen_battles": [], "ranked": {}, "unranked": {}}
-                p_armies = armies_db[tag]
-                if "armies" in p_armies: p_armies["ranked"] = p_armies.pop("armies")
-                p_armies.setdefault("ranked", {}); p_armies.setdefault("unranked", {})
+                p_armies = migrate_armies(armies_db[tag])
                 
                 for b in items:
                     sig = get_battle_sig(b)
@@ -313,7 +321,7 @@ def process_war_data(war_data, superwhoo_data, tracked_clan_tags, tracked_player
 
 async def process_clan_wars(bot, clan_tags, tracked_players):
     if not clan_tags: return
-    headers, superwhoo_data = {'Authorization': f'Bearer {COC_TOKEN}'}, await load_json_file(SUPERWHOO_FILE, {})
+    headers, superwhoo_data = COC_HEADERS, await load_json_file(SUPERWHOO_FILE, {})
     for c_tag in clan_tags:
         c_tag_clean = c_tag.replace('#', '%23')
         status, war = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{c_tag_clean}/currentwar", headers)
@@ -334,7 +342,7 @@ async def build_leaderboard_embeds(bot):
     players = await load_json_file(PLAYERS_FILE, [])
     if not players:
         embed = discord.Embed(title=f"{TROPHY_EMOJI} Server Leaderboard {TROPHY_EMOJI}", description="The server leaderboard is empty. Ask an admin to use `/add` or `/add_clan`.", color=discord.Color.gold())
-        embed.timestamp, embed.set_footer = discord.utils.utcnow(), lambda **k: setattr(embed, '_footer', k)
+        embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="Page 1/1 | Last Refreshed")
         return [embed], set(), [] 
 
@@ -343,7 +351,7 @@ async def build_leaderboard_embeds(bot):
         load_json_file(NAME_CACHE_FILE, {}), load_json_file(ARMIES_DB_FILE, {})
     )
     
-    new_cache, data_list, unique_clans, headers, semaphore = {}, [], set(), {'Authorization': f'Bearer {COC_TOKEN}'}, asyncio.Semaphore(3)
+    new_cache, data_list, unique_clans, headers, semaphore = {}, [], set(), COC_HEADERS, asyncio.Semaphore(3)
     results = await asyncio.gather(*(fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, armies_db, semaphore) for tag in players))
 
     for p_dict, tag, cur_trophies, raw in results:
@@ -388,8 +396,7 @@ class LeaderboardView(discord.ui.View):
     async def ensure_embeds(self, interaction):
         if not self.embeds:
             await interaction.response.defer()
-            self.embeds, unique_clans, tracked_players = await build_leaderboard_embeds(self.bot)
-            self.bot.loop.create_task(process_clan_wars(self.bot, unique_clans, tracked_players))
+            self.embeds = await refresh_lb(self.bot)
             try:
                 original_msg = await interaction.channel.fetch_message(interaction.message.id)
                 self.current_page = int(original_msg.embeds[0].footer.text.split('|')[0].strip().split(' ')[1].split('/')[0]) - 1
@@ -419,9 +426,7 @@ class LeaderboardView(discord.ui.View):
         for child in self.children: child.disabled = True
         await interaction.response.edit_message(embed=loading_embed, view=self)
         
-        self.bot.last_refresh_time = current_time
-        self.embeds, unique_clans, tracked_players = await build_leaderboard_embeds(self.bot)
-        self.bot.loop.create_task(process_clan_wars(self.bot, unique_clans, tracked_players))
+        self.embeds = await refresh_lb(self.bot)
         self.current_page = min(self.current_page, len(self.embeds) - 1)
         for child in self.children: child.disabled = False
         self.update_buttons(); self.save_state(interaction)
@@ -433,7 +438,7 @@ class LeaderboardView(discord.ui.View):
         self.update_buttons(); self.save_state(interaction)
         await (interaction.edit_original_response if interaction.response.is_done() else interaction.response.edit_message)(embed=self.embeds[self.current_page], view=self)
 
-# Generic paginator that we can reuse for both Armies and Battle Logs
+
 class EmbedPaginator(discord.ui.View):
     def __init__(self, embeds):
         super().__init__(timeout=300)
@@ -458,6 +463,113 @@ class EmbedPaginator(discord.ui.View):
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
 
+class BattleLogView(discord.ui.View):
+    def __init__(self, offenses, defenses, display_name, target_tag, mode_name):
+        super().__init__(timeout=300)
+        self.offenses = offenses
+        self.defenses = defenses
+        self.display_name = display_name
+        self.target_tag = target_tag
+        self.mode_name = mode_name
+        
+        self.current_page = 0
+        self.view_mode = "offense" if offenses else "defense"
+        
+        # FIX: Lowering chunk_size prevents the string slice from breaking custom Discord emojis.
+        self.chunk_size = 2  
+        
+        self.update_state()
+
+    def get_current_data(self):
+        return self.offenses if self.view_mode == "offense" else self.defenses
+
+    def update_state(self):
+        data = self.get_current_data()
+        max_pages = max(1, (len(data) + self.chunk_size - 1) // self.chunk_size)
+        self.current_page = min(self.current_page, max_pages - 1)
+
+        self.prev_button.disabled = self.current_page <= 0
+        self.next_button.disabled = self.current_page >= max_pages - 1
+
+        self.offense_btn.style = discord.ButtonStyle.success if self.view_mode == "offense" else discord.ButtonStyle.secondary
+        self.defense_btn.style = discord.ButtonStyle.danger if self.view_mode == "defense" else discord.ButtonStyle.secondary
+
+        self.offense_btn.disabled = not self.offenses
+        self.defense_btn.disabled = not self.defenses
+
+    def build_embed(self):
+        data = self.get_current_data()
+        total_pages = max(1, (len(data) + self.chunk_size - 1) // self.chunk_size)
+
+        embed = discord.Embed(
+            title=f"{'🏆 Legend League' if self.mode_name == 'ranked' else '⚔️ Unranked'} {self.view_mode.capitalize()} Log: {self.display_name}",
+            color=discord.Color.brand_green() if self.view_mode == "offense" else discord.Color.brand_red()
+        )
+
+        chunk = data[self.current_page * self.chunk_size : (self.current_page + 1) * self.chunk_size]
+        value = "\n---\n".join(chunk) if chunk else f"No {self.view_mode} records found."
+
+        if len(value) > 4000: value = value[:4000] + "..."
+        
+        embed.description = value
+        embed.set_footer(text=f"Page {self.current_page + 1} of {total_pages} | Tag: #{self.target_tag}")
+        
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="bl_prev")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        self.update_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="⚔️ Offense", style=discord.ButtonStyle.success, custom_id="bl_off")
+    async def offense_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.view_mode = "offense"
+        self.current_page = 0
+        self.update_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="🛡️ Defense", style=discord.ButtonStyle.secondary, custom_id="bl_def")
+    async def defense_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.view_mode = "defense"
+        self.current_page = 0
+        self.update_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="bl_next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self.update_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+class SelfRoleView(discord.ui.View):
+    def __init__(self):
+        # Timeout must be None for persistent views
+        super().__init__(timeout=None)
+
+    async def handle_role(self, interaction: discord.Interaction, role_name: str):
+        # Find the role by exact name string
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if not role:
+            return await interaction.response.send_message(f"❌ The role **{role_name}** could not be found in this server. Please create it first.", ephemeral=True)
+            
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(f"➖ Successfully removed the **{role_name}** role.", ephemeral=True)
+        else:
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(f"➕ Successfully added the **{role_name}** role.", ephemeral=True)
+
+    @discord.ui.button(label="ORE WARS role", style=discord.ButtonStyle.primary, custom_id="role_btn_ore_wars", emoji="⚔️")
+    async def btn_ore_wars(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_role(interaction, "ORE WARS")
+
+    @discord.ui.button(label="Friendly Challenge role", style=discord.ButtonStyle.success, custom_id="role_btn_fc", emoji="🛡️")
+    async def btn_fc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_role(interaction, "Friendly Challenge")
+
+
 # --- BOT CLASS & SETUP ---
 class CoCBot(commands.Bot):
     def __init__(self):
@@ -465,7 +577,11 @@ class CoCBot(commands.Bot):
         self.session, self.last_refresh_time, self.manual_lb_messages, self.lb_pages = None, 0.0, {}, {}
 
     async def setup_hook(self):
-        self.session = aiohttp.ClientSession(); self.add_view(LeaderboardView(self)); await self.tree.sync()
+        self.session = aiohttp.ClientSession()
+        self.add_view(LeaderboardView(self))
+        # Register the persistent role view so it survives bot restarts
+        self.add_view(SelfRoleView()) 
+        await self.tree.sync()
         if not auto_update_leaderboard.is_running(): auto_update_leaderboard.start()
 
     async def close(self):
@@ -481,9 +597,7 @@ async def on_ready(): logger.info(f'Logged in as {bot.user.name} with Async Requ
 @tasks.loop(minutes=5)
 async def auto_update_leaderboard():
     try:
-        embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
-        bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
-        bot.last_refresh_time = time.time()
+        embeds = await refresh_lb(bot)
         config = await load_json_file(CONFIG_FILE, {})
         if config.get("channel_id") and config.get("message_id") and (channel := bot.get_channel(config["channel_id"])):
             message = await channel.fetch_message(config["message_id"])
@@ -492,6 +606,16 @@ async def auto_update_leaderboard():
             logger.info("Auto-updated background leaderboard successfully.")
     except discord.NotFound: logger.warning("Leaderboard message not found. Clearing config."); await save_json_file(CONFIG_FILE, {})
     except Exception as e: logger.error(f"Failed to auto-update leaderboard: {e}")
+
+@auto_update_leaderboard.before_loop
+async def before_auto_update():
+    await bot.wait_until_ready()
+
+async def refresh_lb(bot):
+    embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
+    bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
+    bot.last_refresh_time = time.time()
+    return embeds
 
 # --- SLASH COMMANDS ---
 @bot.tree.command(name='setleaderboard', description="Set up the automated updating leaderboard in this channel.")
@@ -503,20 +627,33 @@ async def set_leaderboard(interaction: discord.Interaction):
         try: await (await old_channel.fetch_message(config["message_id"])).delete()
         except: pass
 
-    embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
-    bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
-    bot.last_refresh_time, view = time.time(), LeaderboardView(bot, embeds)
+    embeds = await refresh_lb(bot)
+    view = LeaderboardView(bot, embeds)
     lb_message = await interaction.channel.send(embed=embeds[0], view=view)
     view.message_id, bot.lb_pages[lb_message.id] = lb_message.id, 0
     await save_json_file(CONFIG_FILE, {"channel_id": interaction.channel_id, "message_id": lb_message.id})
     await interaction.followup.send("✅ Automated leaderboard successfully set up in this channel!", ephemeral=True)
+
+@bot.tree.command(name='setup_roles', description="Set up the self-assignable roles message in this channel.")
+@is_admin_or_owner()
+async def setup_roles(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎭 Self-Assign Roles",
+        description="Click the buttons below to add or remove roles.\n\n"
+                    "⚔️ **ORE WARS** - Get pinged for Ore Wars.\n"
+                    "🛡️ **FC role** - Get pinged for Friendly Challenges(FC).",
+        color=discord.Color.blurple()
+    )
+    await interaction.channel.send(embed=embed, view=SelfRoleView())
+    await interaction.response.send_message("✅ Self-assign roles menu has been deployed!", ephemeral=True)
+
 
 @bot.tree.command(name='add', description="Add a Clash of Clans player to the tracker.")
 @is_admin_or_owner()
 async def add_player(interaction: discord.Interaction, player_tag: str):
     await interaction.response.defer(ephemeral=True)
     clean_tag = player_tag.strip().lstrip('#').upper()
-    status, data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{clean_tag}", {'Authorization': f'Bearer {COC_TOKEN}'})
+    status, data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{clean_tag}", COC_HEADERS)
     
     if status == 200 and data:
         players = await load_json_file(PLAYERS_FILE, [])
@@ -532,7 +669,7 @@ async def add_player(interaction: discord.Interaction, player_tag: str):
 @is_admin_or_owner()
 async def add_clan(interaction: discord.Interaction, clan_tag: str):
     await interaction.response.defer(ephemeral=True)
-    status, data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/clans/%23{clan_tag.strip().lstrip('#').upper()}", {'Authorization': f'Bearer {COC_TOKEN}'})
+    status, data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/clans/%23{clan_tag.strip().lstrip('#').upper()}", COC_HEADERS)
     
     if status == 200 and data:
         players, name_cache, added_count = await load_json_file(PLAYERS_FILE, []), await load_json_file(NAME_CACHE_FILE, {}), 0
@@ -565,16 +702,10 @@ async def command_leaderboard(interaction: discord.Interaction):
     if interaction.channel_id in bot.manual_lb_messages:
         try: await (await interaction.channel.fetch_message(bot.manual_lb_messages[interaction.channel_id])).delete()
         except: pass
-    embeds, unique_clans, tracked_players = await build_leaderboard_embeds(bot)
-    bot.loop.create_task(process_clan_wars(bot, unique_clans, tracked_players))
-    bot.last_refresh_time, view = time.time(), LeaderboardView(bot, embeds)
+    embeds = await refresh_lb(bot)
+    view = LeaderboardView(bot, embeds)
     msg = await interaction.followup.send(embed=embeds[0], view=view, wait=True)
     bot.manual_lb_messages[interaction.channel_id] = msg.id; view.message_id = msg.id; bot.lb_pages[msg.id] = 0
-
-@command_leaderboard.error
-async def command_leaderboard_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CommandOnCooldown):
-        await interaction.response.send_message(f"⏳ The leaderboard command is on cooldown! Try again in **{int(error.retry_after)//60}m {int(error.retry_after)%60}s**.", ephemeral=True)
 
 @bot.tree.command(name='profile', description="Look up a specific Clash of Clans player profile.")
 @app_commands.autocomplete(player=player_autocomplete)
@@ -583,12 +714,13 @@ async def player_profile(interaction: discord.Interaction, player: str):
     if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
     
     legend_stats_cache, armies_db = await load_json_file(LEGEND_STATS_FILE, {}), await load_json_file(ARMIES_DB_FILE, {}) 
-    p_dict, _, _, raw = await fetch_player_data(interaction.client.session, target_tag, {'Authorization': f'Bearer {COC_TOKEN}'}, {}, legend_stats_cache, armies_db)
+    p_dict, _, _, raw = await fetch_player_data(interaction.client.session, target_tag, COC_HEADERS, {}, legend_stats_cache, armies_db)
     await asyncio.gather(save_json_file(LEGEND_STATS_FILE, legend_stats_cache), save_json_file(ARMIES_DB_FILE, armies_db))
 
     if raw:
         sw_count = (await load_json_file(SUPERWHOO_FILE, {})).get(f"#{target_tag}", {}).get("count", 0)
-        embed = discord.Embed(title=f"{p_dict['emoji']} {raw.get('name')} (TH{p_dict['th']})", url=f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={target_tag}", color=discord.Color.blue())
+        formatted_profile_name = '/Sam\\' if raw.get('name', '').lower() == 'sam' else raw.get('name', 'Unknown')
+        embed = discord.Embed(title=f"{p_dict['emoji']} {formatted_profile_name} (TH{p_dict['th']})", url=f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={target_tag}", color=discord.Color.blue())
         embed.add_field(name="Clan", value=f"{raw.get('clan', {}).get('name', 'No Clan')} ({raw.get('role', 'Member').capitalize() if raw.get('clan') else 'N/A'})", inline=False)
         embed.add_field(name="Trophies", value=f"{TROPHY_EMOJI} {raw.get('trophies')} (Best: {raw.get('bestTrophies')})", inline=True)
         embed.add_field(name="War Stars", value=f"⭐ {raw.get('warStars')}", inline=True)
@@ -606,8 +738,7 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
     if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
         
     armies_db = await load_json_file(ARMIES_DB_FILE, {})
-    if target_tag in armies_db and "armies" in armies_db[target_tag]:
-        armies_db[target_tag]["ranked"] = armies_db[target_tag].pop("armies"); armies_db[target_tag].setdefault("unranked", {})
+    if target_tag in armies_db: migrate_armies(armies_db[target_tag])
             
     has_tracked = target_tag in armies_db and armies_db[target_tag].get(mode)
     armies_to_show = {}
@@ -618,11 +749,11 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
         title_prefix = "All-Time Tracked"
         display_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f"#{target_tag}")
     else:
-        status, log_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", {'Authorization': f'Bearer {COC_TOKEN}'})
+        status, log_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", COC_HEADERS)
         if status == 403: return await interaction.followup.send("🔒 This player's battle log is private.")
         if status != 200 or not log_data or 'items' not in log_data: return await interaction.followup.send("❌ Could not fetch battle log.")
             
-        profile_status, profile_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}", {'Authorization': f'Bearer {COC_TOKEN}'})
+        profile_status, profile_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}", COC_HEADERS)
         display_name = profile_data.get('name', f"#{target_tag}") if profile_status == 200 else f"#{target_tag}"
         
         for b in log_data.get('items', []):
@@ -630,6 +761,9 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
                 armies_to_show.setdefault(b['armyShareCode'], {"uses": 0, "total_dest": 0})
                 armies_to_show[b['armyShareCode']]["uses"] += 1; armies_to_show[b['armyShareCode']]["total_dest"] += b.get('destructionPercentage', 0)
         title_prefix = "Recent Live"
+        
+    if display_name.lower() == "sam":
+        display_name = "/Sam\\"
         
     if not armies_to_show: return await interaction.followup.send(f"⚠️ No **{mode}** armies found for this player in their recent log.")
         
@@ -658,10 +792,11 @@ async def player_armies(interaction: discord.Interaction, player: str, mode: str
         embeds.append(embed)
 
     if len(embeds) > 1:
-        view = EmbedPaginator(embeds) # Swapped to the new generic paginator!
+        view = EmbedPaginator(embeds) 
         await interaction.followup.send(embed=embeds[0], view=view)
     else:
         await interaction.followup.send(embed=embeds[0])
+
 
 
 # --- BATTLE LOG COMMAND ---
@@ -680,7 +815,7 @@ async def command_battle_log(interaction: discord.Interaction, player: str, mode
     status, log_data = await safe_fetch(
         interaction.client.session, 
         f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", 
-        {'Authorization': f'Bearer {COC_TOKEN}'}
+        COC_HEADERS
     )
     
     if status == 403: 
@@ -688,8 +823,36 @@ async def command_battle_log(interaction: discord.Interaction, player: str, mode
     if status != 200 or not log_data or 'items' not in log_data: 
         return await interaction.followup.send("❌ Could not fetch the battle log or the log is empty.")
 
-    display_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f"#{target_tag}")
+    name_cache = await load_json_file(NAME_CACHE_FILE, {})
+    display_name = name_cache.get(target_tag, f"#{target_tag}")
+    if display_name.lower() == "sam":
+        display_name = "/Sam\\"
     
+    # Pass 1: Find any opponents missing their names and fetch them
+    missing_tags = set()
+    for b in log_data.get('items', []):
+        is_attack = b.get('attack', False)
+        opponent_dict = b.get('defender', {}) if is_attack else b.get('attacker', {})
+        if 'name' not in opponent_dict and 'opponentPlayerTag' in b:
+            tag = b['opponentPlayerTag'].replace('#', '').upper()
+            if tag not in name_cache:
+                missing_tags.add(tag)
+
+    if missing_tags:
+        async def fetch_missing_name(tag):
+            s, d = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{tag}", COC_HEADERS)
+            return tag, d.get('name') if s == 200 and d else None
+
+        results = await asyncio.gather(*(fetch_missing_name(t) for t in missing_tags))
+        new_names_found = False
+        for tag, name in results:
+            if name:
+                name_cache[tag] = name
+                new_names_found = True
+        if new_names_found:
+            await save_json_file(NAME_CACHE_FILE, name_cache)
+
+    # Pass 2: Build the embeds
     offenses = []
     defenses = []
     
@@ -698,68 +861,42 @@ async def command_battle_log(interaction: discord.Interaction, player: str, mode
         
         if (mode == "ranked" and not is_ranked) or (mode == "unranked" and is_ranked):
             continue
-
-        time_str = "Unknown Date"
-        if 'battleTime' in b:
-            try:
-                time_str = datetime.datetime.strptime(b['battleTime'].split('.')[0], "%Y%m%dT%H%M%S").strftime("%b %d, %H:%M")
-            except:
-                pass
-        
+            
         dest = b.get('destructionPercentage', 0)
         stars = b.get('stars', 0)
         is_attack = b.get('attack', False)
         army_code = b.get('armyShareCode')
         
-        army_text = get_army_summary(army_code) if army_code else "Unknown / Not Exposed by API"
+        opponent_dict = b.get('defender', {}) if is_attack else b.get('attacker', {})
+        opponent_name = opponent_dict.get('name')
 
-        entry = f"**Date:** {time_str} | **Result:** {dest}% | {stars} ⭐\n**Army:** {army_text}\n"
+        if not opponent_name and 'opponentPlayerTag' in b:
+            tag = b['opponentPlayerTag'].replace('#', '').upper()
+            opponent_name = name_cache.get(tag, f"#{tag}") # Fallback to the tag if the API fetch failed
+            
+        if not opponent_name:
+            opponent_name = "Unknown"
+        
+        army_text = get_army_summary(army_code) if army_code else "Unknown / Not Exposed by API"
+        star_display = "⭐" * stars if stars > 0 else "0 ⭐"
+
+        entry = f"**Vs:** {discord.utils.escape_markdown(opponent_name)} | {dest}% | {star_display}\n{army_text}\n"
         
         if is_attack:
             offenses.append(entry)
         else:
             defenses.append(entry)
 
-    # Safety limits: 2 per page prevents massive discord emoji strings from overflowing the 1024 limit
-    chunk_size = 2
-    max_len = max(len(offenses), len(defenses))
-    
-    if max_len == 0:
+    if not offenses and not defenses:
         return await interaction.followup.send(f"⚠️ No recent {mode} records found in the API log.")
 
-    total_pages = max(1, (max_len + chunk_size - 1) // chunk_size)
-    embeds = []
-
-    for i in range(total_pages):
-        embed = discord.Embed(
-            title=f"{'🏆 Legend League' if mode == 'ranked' else '⚔️ Unranked'} Battle Log: {display_name}", 
-            color=discord.Color.dark_gray() if mode == 'unranked' else discord.Color.brand_green()
-        )
-        
-        off_chunk = offenses[i * chunk_size : (i + 1) * chunk_size]
-        def_chunk = defenses[i * chunk_size : (i + 1) * chunk_size]
-
-        offense_value = "\n---\n".join(off_chunk) if off_chunk else "No offensive records on this page."
-        defense_value = "\n---\n".join(def_chunk) if def_chunk else "No defensive records on this page."
-
-        # Final failsafe truncations
-        if len(offense_value) > 1024: offense_value = offense_value[:1020] + "..."
-        if len(defense_value) > 1024: defense_value = defense_value[:1020] + "..."
-
-        embed.add_field(name="⚔️ Offenses", value=offense_value, inline=False)
-        embed.add_field(name="🛡️ Defenses", value=defense_value, inline=False)
-        embed.set_footer(text=f"Page {i+1} of {total_pages} | Tag: #{target_tag}")
-        
-        embeds.append(embed)
-
-    if len(embeds) > 1:
-        view = EmbedPaginator(embeds)
-        await interaction.followup.send(embed=embeds[0], view=view)
-    else:
-        await interaction.followup.send(embed=embeds[0])
+    # Utilize the custom interactive toggle view!
+    view = BattleLogView(offenses, defenses, display_name, target_tag, mode)
+    await interaction.followup.send(embed=view.build_embed(), view=view)
 
 
-@bot.tree.command(name='superwhoo', description="Shows the leaderboard or a specific player's 97-99% attack fails!")
+# --- SUPERWHOO COMMAND ---
+@bot.tree.command(name='superwhoo', description="View the Superwhoo Leaderboard or a specific player's painful misses.")
 @app_commands.autocomplete(player=player_autocomplete)
 async def command_superwhoo(interaction: discord.Interaction, player: str = None):
     await interaction.response.defer()
@@ -769,24 +906,34 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
     if player:
         if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
         p_data = superwhoo_data.get(f"#{target_tag}")
-        if not p_data or p_data['count'] == 0: return await interaction.followup.send(f"✅ Great news! **{(await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f'#{target_tag}')}** has no recorded fails.")
+        
+        raw_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f'#{target_tag}')
+        formatted_name = '/Sam\\' if raw_name.lower() == 'sam' else raw_name
+        
+        if not p_data or p_data['count'] == 0: return await interaction.followup.send(f"✅ Great news! **{formatted_name}** has no recorded fails.")
 
         history_text = ""
         for sig in reversed(p_data['seen']):
             parts = sig.split('_')
             try: time_str = datetime.datetime.strptime(parts[0], "%Y%m%dT%H%M%S.000Z").strftime("%b %d, %Y") if len(parts) >= 3 else "Unknown Date"
             except: time_str = "Unknown Date"
-            history_text += f"• **{f'{parts[5]}%' if len(parts) >= 6 else '97-99%'}** ({parts[4] if len(parts) >= 6 else '?'}⭐) *(War Ended: {time_str})*\n"
+            
+            if len(parts) >= 6 and parts[4].isdigit():
+                star_display = "☆" * int(parts[4]) if int(parts[4]) > 0 else "0 ☆"
+            else:
+                star_display = "?"
+                
+            history_text += f"• **{f'{parts[5]}%' if len(parts) >= 6 else '97-99%'}** ({star_display}) *(War Ended: {time_str})*\n"
 
         if len(history_text) > 4000: history_text = history_text[:4000] + "...\n*(Showing latest 50)*"
-        embed = discord.Embed(title=f"💔 {p_data['name']}'s Superwhoo History", color=discord.Color.red())
+        embed = discord.Embed(title=f"💔 {formatted_name}'s Superwhoo History", color=discord.Color.red())
         embed.add_field(name=f"Total Fails: {p_data['count']}", value=history_text, inline=False)
         return await interaction.followup.send(embed=embed)
 
     lb = sorted([{"name": d['name'], "count": d['count']} for d in superwhoo_data.values() if d['count'] > 0], key=lambda x: x['count'], reverse=True)
     if not lb: return await interaction.followup.send("🏆 The Superwhoo Leaderboard is currently empty. No painful misses yet!")
 
-    desc_text = "".join(f"{'🥇' if i==1 else '🥈' if i==2 else '🥉' if i==3 else f'`{i}.`'} **{discord.utils.escape_markdown(p['name'])}** - {p['count']} Superwhoo{'s' if p['count'] != 1 else ''}\n" for i, p in enumerate(lb[:50], 1))
+    desc_text = "".join(f"{'🥇' if i==1 else '🥈' if i==2 else '🥉' if i==3 else f'`{i}.`'} **{discord.utils.escape_markdown('/Sam\\' if p['name'].lower() == 'sam' else p['name'])}** - {p['count']} Superwhoo{'s' if p['count'] != 1 else ''}\n" for i, p in enumerate(lb[:50], 1))
     embed = discord.Embed(title="🏆 The Superwhoo Leaderboard 🏆", description="The ultimate wall of shame for 97-99% war attacks (Normal & CWL).", color=discord.Color.red())
     embed.add_field(name="Rankings", value=desc_text, inline=False)
     await interaction.followup.send(embed=embed)
@@ -816,7 +963,10 @@ async def force_sync(ctx):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure): await interaction.response.send_message("⛔ You do not have permission to use this command.", ephemeral=True)
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("⛔ You do not have permission to use this command.", ephemeral=True)
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"⏳ This command is on cooldown! Try again in **{int(error.retry_after)//60}m {int(error.retry_after)%60}s**.", ephemeral=True)
     else:
         logger.error(f"App command error: {error}")
         if not interaction.response.is_done(): await interaction.response.send_message("❌ An unexpected error occurred.", ephemeral=True)
