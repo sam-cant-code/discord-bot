@@ -372,7 +372,6 @@ async def build_leaderboard_embeds(bot):
     for i in range(0, max(1, len(data_list)), chunk_size):
         desc = ""
         for j, p in enumerate(data_list[i:i + chunk_size], start=i + 1):
-            # This is the line that was modified to bold the serial number and trophy count using ** around the backticks
             line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} [**`{format_name_strict(p['name'], 10)}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})**`|{p['trophies']:>4}`**{TROPHY_EMOJI}"
             if p.get('league_weight') == 34:
                 ll = p.get('legend_log')
@@ -600,6 +599,87 @@ async def refresh_lb(bot):
     return embeds
 
 # --- SLASH COMMANDS ---
+@bot.tree.command(name='clan_info', description="Displays the clans in our alliance along with their links, types, and stats.")
+async def command_clan_info(interaction: discord.Interaction):
+    # Defer so the API calls don't timeout the slash command
+    await interaction.response.defer()
+
+    # ⚠️ Put your EXACT file names here (e.g., "angrybirdsbanner.jpeg")
+    # Make sure these images are in the exact same folder as this Python script!
+    alliance_clans = [
+        {
+            "tag": "#2QUVQR0LC", 
+            "type": "Competitive clan",
+            "requirements": "TH17+, Skilled Attacker", # You can customize this
+            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2QUVQR0LC",
+            "image_filename": "angrybirdsbanner.jpeg",
+            "color": discord.Color.red()
+        },
+        {
+            "tag": "#2GCCRP2JY", 
+            "type": "CWL Feeder clan",
+            "requirements": "None", 
+            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2GCCRP2JY",
+            "image_filename": "nightbirdsbanner.jpeg",
+            "color": discord.Color.purple()
+        },
+        {
+            "tag": "#2RYPQ0GRQ", 
+            "type": "Ore wars/sidewars clan",
+            "requirements": "None", # You can customize this
+            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2RYPQ0GRQ",
+            "image_filename": "elitesyndicatebanner.jpeg",
+            "color": discord.Color.blue()
+        }
+    ]
+
+    embeds_to_send = []
+    files_to_send = []
+
+    for clan in alliance_clans:
+        clean_tag = clan['tag'].replace('#', '%23')
+        # Fetching Clan stats from API
+        status, clan_data = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{clean_tag}", COC_HEADERS)
+        
+        wins = clan_data.get('warWins', 0) if status == 200 else "N/A"
+        streak = clan_data.get('warWinStreak', 0) if status == 200 else "N/A"
+        league = clan_data.get('warLeague', {}).get('name', 'Unranked') if status == 200 else "N/A"
+
+        # 1. Create the Text Embed (Appears Second)
+        text_embed = discord.Embed(
+            description=(
+                f"**Type:** {clan['type']}\n"
+                f"**Requirements:** {clan['requirements']}\n"
+                f"**Clan League:** {league}\n"
+                f"**Win Streak:** 🔥 {streak}\n"
+                f"[🔗 View in Game]({clan['link']})"
+            ),
+            color=clan['color']
+        )
+        
+        try:
+            # Package the local file so Discord can read it
+            file = discord.File(clan['image_filename'], filename=clan['image_filename'])
+            files_to_send.append(file)
+            
+            # 2. Create the Image Embed (Appears First)
+            img_embed = discord.Embed(color=clan['color'])
+            
+            # Tell the embed to use the attached file as its image
+            img_embed.set_image(url=f"attachment://{clan['image_filename']}") 
+            
+            # Add the Image embed BEFORE the Text embed to force the stacking order
+            embeds_to_send.append(img_embed)
+            embeds_to_send.append(text_embed)
+            
+        except FileNotFoundError:
+            # If the file is missing, we skip the image embed but still send the text
+            text_embed.description = f"*(Error: Could not find image file `{clan['image_filename']}`)*\n\n" + text_embed.description
+            embeds_to_send.append(text_embed)
+
+    # Send the embeds AND the packaged files together
+    await interaction.followup.send(embeds=embeds_to_send, files=files_to_send)
+
 @bot.tree.command(name='setleaderboard', description="Set up the automated updating leaderboard in this channel.")
 @is_admin_or_owner()
 async def set_leaderboard(interaction: discord.Interaction):
