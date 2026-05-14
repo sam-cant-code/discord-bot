@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import aiohttp, asyncio, json, os, time, logging, contextlib, datetime, re, io
+import aiohttp, asyncio, json, os, time, logging, contextlib, datetime, io
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -11,7 +11,7 @@ load_dotenv()
 
 PLAYERS_FILE, CONFIG_FILE, TROPHY_CACHE_FILE = 'players.json', 'lb_config.json', 'trophy_cache.json'
 LEGEND_STATS_FILE, SUPERWHOO_FILE = 'legend_stats.json', 'superwhoo_stats.json'
-NAME_CACHE_FILE, ARMIES_DB_FILE = 'name_cache.json', 'armies_db.json'
+NAME_CACHE_FILE = 'name_cache.json'
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
@@ -36,35 +36,12 @@ LEAGUE_EMOJIS = {
     "Titan League 25": "<:titan_league_25:1485298109981397163>", "Titan League 26": "<:titan_league_26:1485298115006300291>", "Titan League 27": "<:titan_league_27:1485298118416269425>",
     "Dragon League 28": "<:dragon_league_28:1485298122505846958>", "Dragon League 29": "<:dragon_league_29:1485298126935031958>", "Dragon League 30": "<:dragon_league_30:1485298131863077104>",
     "Electro League 31": "<:electro_league_31:1485298134958735360>", "Electro League 32": "<:electro_league_32:1485298138066714794>", "Electro League 33": "<:electro_league_33:1485298142776918126>",
-    "Legend League": "<:legend_league:1485298146186625205>"
+    "Legend League": "<:legend_league:1485298146186625205>",
+    "Legend League 3": "<:legend_league:1485298146186625205>",
+    "Legend League 2": "<:legend_league:1485298146186625205>",
+    "Legend League 1": "<:legend_league:1485298146186625205>"
 }
 LEAGUE_WEIGHTS = {name: i for i, name in enumerate(LEAGUE_EMOJIS.keys(), start=1)}
-
-TROOP_EMOJIS = {
-    0: "<:Avatar_Barbarian:1493123027486117978>", 1: "<:Avatar_Archer:1493123099598655639>", 2: "goblin", 3: "giant", 4: "wallbreaker", 5: "balloon",
-    6: "wizard", 7: "healer", 8: "dragon", 9: "pekka", 10: "<:Avatar_Minion:1493123172822810674> ", 11: "hogrider", 12: "valkyrie", 13: "golem",
-    15: "witch", 17: "<:Avatar_Lava_Hound:1493123323939262604>", 22: "bowler", 23: "<:Avatar_Baby_Dragon:1493123145526280202>", 24: "miner",
-    26: "superbarbarian", 27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 53: "yeti", 57: "<:Avatar_Rocket_Balloon:1493123292763000943>",
-    58: "icegolem", 59: "electrodragon", 62: "stoneslammer", 63: "<:Avatar_Inferno_Dragon:1493123215545995335>", 65: "<:Avatar_Dragon_Rider:1493122980795125931>",
-    66: "troop66", 75: "<:Avatar_Siege_Barracks:1493245189450633397> ", 80: "<:Avatar_Rocket_Balloon:1493123292763000943> ", 82: "headhunter",
-    87: "loglauncher", 91: "flameflinger", 92: "battledrill", 95: "electrotitan", 97: "apprenticewarden", 110: "rootrider", 132: "thrower",
-    147: "meteorgolem", 150: "furnace", 177: "smasher"
-}
-
-SPELL_EMOJIS = {
-    0: "lightning", 1: "heal", 2: "rage", 3: "jump", 4: "spell4", 5: "<:Freeze_Spell_info:1493245284740894921>", 7: "earthquake", 8: "haste",
-    9: "<:Poison_Spell_info:1493245348628664600>", 10: "bat", 11: "invisibility", 17: "<:Skeleton_Spell_info:1493865965153423501>", 70: "<:Overgrowth_Spell_info:1493245378483454052>", 98: "<:Revive_Spell_info:1493245315405447218>", 120: "<:Totem_Spell_info:1493245251270348992>"
-}
-
-HEROES = {
-    0: "Barbarian King", 1: "<:Avatar_Hero_Archer_Queen:1493875811319681055>", 2: "<:Avatar_Hero_Grand_Warden:1493875923357794324>", 
-    4: "Royal Champion", 6: "Minion Prince", 7: "<:Avatar_Hero_Dragon_Duke:1493875886921879623>"
-}
-
-PETS = {
-    0: "L.A.S.S.I", 1: "Mighty Yak", 2: "Electro Owl", 3: "Unicorn", 6: "<:Avatar_Phoenix:1493876190396678235>",
-    7: "Poison Lizard", 8: "Diggy", 9: "<:Avatar_Frosty:1493876156691120148>", 10: "Spirit Fox", 11: "<:Avatar_Angry_Jelly:1493876225159073812> "
-}
 
 TIER_ID_TO_NAME = {
     105000001: "Skeleton League 1", 105000002: "Skeleton League 2", 105000003: "Skeleton League 3", 105000004: "Barbarian League 4",
@@ -127,71 +104,6 @@ get_league_emoji = lambda l: LEAGUE_EMOJIS.get(l, "➖")
 get_league_weight = lambda l: LEAGUE_WEIGHTS.get(l, 0)
 get_battle_sig = lambda b: f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}"
 
-SNEEZY_DISPLAY = "<:Avatar_Sneezy:1493876254443835432>"
-
-def get_army_summary(share_code: str) -> str:
-    if not share_code: return "Unknown Troops"
-    units, spells, hero_pets = [], [], []
-    u_match = re.search(r'u([\d\-x]+)', share_code)
-    s_match = re.search(r's([\d\-x]+)', share_code)
-
-    if u_match:
-        u_items = u_match.group(1).split('-')
-        consumed = set()
-
-        # STEP 1: Find Warden first, assign pet or default to Sneezy
-        for idx, item in enumerate(u_items):
-            if 'x' not in item:
-                continue
-            qty, u_id = map(int, item.split('x'))
-            if qty == 1 and u_id == 2:  # 2 = Grand Warden
-                consumed.add(idx)
-                next_idx = idx + 1
-                if next_idx < len(u_items) and 'x' in u_items[next_idx]:
-                    n_qty, n_id = map(int, u_items[next_idx].split('x'))
-                    if n_qty == 1 and n_id in PETS:
-                        hero_pets.insert(0, f"{HEROES[2]} & {PETS[n_id]}")
-                        consumed.add(next_idx)
-                    else:
-                        hero_pets.insert(0, f"{HEROES[2]} & {SNEEZY_DISPLAY}")
-                else:
-                    hero_pets.insert(0, f"{HEROES[2]} & {SNEEZY_DISPLAY}")
-                break
-
-        # STEP 2: Process troops, then remaining heroes+pets
-        combo_count = len(hero_pets)
-        skip_next = False
-
-        for idx, item in enumerate(u_items):
-            if idx in consumed:
-                continue
-            if skip_next:
-                skip_next = False
-                continue
-            if 'x' not in item:
-                continue
-            qty, u_id = map(int, item.split('x'))
-
-            if qty == 1 and u_id in HEROES and combo_count < 4:
-                next_idx = idx + 1
-                if next_idx < len(u_items) and 'x' in u_items[next_idx] and next_idx not in consumed:
-                    n_qty, n_id = map(int, u_items[next_idx].split('x'))
-                    if n_qty == 1 and n_id in PETS:
-                        hero_pets.append(f"{HEROES[u_id]} & {PETS[n_id]}")
-                        skip_next = True
-                        combo_count += 1
-                        continue
-
-            units.append(f"{qty}x{TROOP_EMOJIS.get(u_id, f'unit{u_id}')}")
-
-    if s_match:
-        for item in s_match.group(1).split('-'):
-            if 'x' in item:
-                qty, s_id = map(int, item.split('x'))
-                spells.append(f"{qty}x{SPELL_EMOJIS.get(s_id, f'spell{s_id}')}")
-
-    return " | ".join(filter(None, [" ".join(units), " ".join(spells), " ".join(hero_pets)])) or "unknowntroops"
-
 def is_admin_or_owner():
     def predicate(interaction: discord.Interaction):
         return interaction.user.id == OWNER_ID or interaction.user.guild_permissions.administrator
@@ -217,14 +129,7 @@ async def fetch_league_history(session, tag, headers):
         return TIER_ID_TO_NAME.get(sorted(hist['items'], key=lambda x: str(x.get('season', '')))[-1].get('leagueTierId', 0), "Unranked")
     return "Unranked"
 
-def migrate_armies(entry):
-    if 'armies' in entry:
-        entry['ranked'] = entry.pop('armies')
-    entry.setdefault('ranked', {})
-    entry.setdefault('unranked', {})
-    return entry
-
-async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, armies_db, semaphore=None):
+async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, semaphore=None):
     async with (semaphore or contextlib.nullcontext()):
         await asyncio.sleep(0.1)
         status, d = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}", headers)
@@ -244,24 +149,8 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
             if log_status == 200 and log_data:
                 items = log_data.get('items', [])
                 
-                # Process Armies DB
-                if tag not in armies_db: armies_db[tag] = {"seen_battles": [], "ranked": {}, "unranked": {}}
-                p_armies = migrate_armies(armies_db[tag])
-                
-                for b in items:
-                    sig = get_battle_sig(b)
-                    if sig not in p_armies["seen_battles"]:
-                        p_armies["seen_battles"].append(sig)
-                        if b.get('attack') and 'armyShareCode' in b:
-                            category = "ranked" if b.get('battleType') in ['legend', 'homeVillage'] else "unranked"
-                            code = b['armyShareCode']
-                            p_armies[category].setdefault(code, {"uses": 0, "total_dest": 0})
-                            p_armies[category][code]["uses"] += 1
-                            p_armies[category][code]["total_dest"] += b.get('destructionPercentage', 0)
-                p_armies["seen_battles"] = p_armies["seen_battles"][-200:]
-                
                 # Process Legend Stats
-                if weight == 34:  
+                if weight >= 34:  
                     if tag not in legend_stats_cache: legend_stats_cache[tag] = {"seen_battles": [], "initialized": False, "off_count": 0, "off_trophies": 0, "def_count": 0, "def_trophies": 0, "last_reset": None}
                     p_stats = legend_stats_cache[tag]
 
@@ -288,7 +177,7 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                         p_stats["seen_battles"] = p_stats["seen_battles"][-100:]
 
                     legend_log = {k: p_stats[k] for k in ['off_count', 'off_trophies', 'def_count', 'def_trophies']}
-            elif log_status == 403 and weight == 34:
+            elif log_status == 403 and weight >= 34:
                 legend_log = "private"
 
             return {
@@ -346,13 +235,12 @@ async def build_leaderboard_embeds(bot):
         embed.set_footer(text="Page 1/1 | Last Updated")
         return [embed], set(), [] 
 
-    trophy_cache, legend_stats_cache, name_cache, armies_db = await asyncio.gather(
-        load_json_file(TROPHY_CACHE_FILE, {}), load_json_file(LEGEND_STATS_FILE, {}), 
-        load_json_file(NAME_CACHE_FILE, {}), load_json_file(ARMIES_DB_FILE, {})
+    trophy_cache, legend_stats_cache, name_cache = await asyncio.gather(
+        load_json_file(TROPHY_CACHE_FILE, {}), load_json_file(LEGEND_STATS_FILE, {}), load_json_file(NAME_CACHE_FILE, {})
     )
     
     new_cache, data_list, unique_clans, headers, semaphore = {}, [], set(), COC_HEADERS, asyncio.Semaphore(3)
-    results = await asyncio.gather(*(fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, armies_db, semaphore) for tag in players))
+    results = await asyncio.gather(*(fetch_player_data(bot.session, tag, headers, trophy_cache, legend_stats_cache, semaphore) for tag in players))
 
     for p_dict, tag, cur_trophies, raw in results:
         if p_dict:
@@ -361,8 +249,9 @@ async def build_leaderboard_embeds(bot):
             if raw and raw.get('name'): name_cache[tag] = raw.get('name')
 
     await asyncio.gather(
-        save_json_file(TROPHY_CACHE_FILE, new_cache), save_json_file(LEGEND_STATS_FILE, legend_stats_cache),
-        save_json_file(NAME_CACHE_FILE, name_cache), save_json_file(ARMIES_DB_FILE, armies_db)
+        save_json_file(TROPHY_CACHE_FILE, new_cache),
+        save_json_file(LEGEND_STATS_FILE, legend_stats_cache),
+        save_json_file(NAME_CACHE_FILE, name_cache)
     )
 
     data_list.sort(key=lambda x: (x['league_weight'], x['trophies']), reverse=True)
@@ -373,7 +262,7 @@ async def build_leaderboard_embeds(bot):
         desc = ""
         for j, p in enumerate(data_list[i:i + chunk_size], start=i + 1):
             line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} [**`{format_name_strict(p['name'], 10)}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})**`|{p['trophies']:>4}`**{TROPHY_EMOJI}"
-            if p.get('league_weight') == 34:
+            if p.get('league_weight') >= 34:
                 ll = p.get('legend_log')
                 if ll == "private": line += " | `🔒 Private`"
                 elif isinstance(ll, dict): line += f" | `+{ll['off_trophies']}{to_superscript(ll['off_count'])}".ljust(9) + f"|-{ll['def_trophies']}{to_superscript(ll['def_count'])}".ljust(7) + "`"
@@ -387,6 +276,24 @@ async def build_leaderboard_embeds(bot):
     return embeds, unique_clans, players
 
 # --- INTERACTIVE VIEWS ---
+
+class SayModal(discord.ui.Modal, title='Make the bot speak'):
+    message_input = discord.ui.TextInput(
+        label='What should the bot say?',
+        style=discord.TextStyle.paragraph, 
+        placeholder='Type your anonymous message here...',
+        required=True,
+        max_length=2000
+    )
+
+    def __init__(self, target_channel: discord.TextChannel):
+        super().__init__()
+        self.target_channel = target_channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.target_channel.send(self.message_input.value)
+        await interaction.response.send_message(f"✅ Ghost message sent to {self.target_channel.mention}!", ephemeral=True)
+
 class LeaderboardView(discord.ui.View):
     def __init__(self, bot, embeds=None, current_page=0, message_id=None):
         super().__init__(timeout=None)
@@ -422,109 +329,6 @@ class LeaderboardView(discord.ui.View):
         await self.ensure_embeds(interaction); self.current_page = min(len(self.embeds) - 1, self.current_page + 1)
         self.update_buttons(); self.save_state(interaction)
         await (interaction.edit_original_response if interaction.response.is_done() else interaction.response.edit_message)(embed=self.embeds[self.current_page], view=self)
-
-
-class EmbedPaginator(discord.ui.View):
-    def __init__(self, embeds):
-        super().__init__(timeout=300)
-        self.embeds = embeds
-        self.current_page = 0
-        self.update_buttons()
-
-    def update_buttons(self):
-        self.prev_button.disabled = self.current_page == 0
-        self.next_button.disabled = self.current_page == len(self.embeds) - 1
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="page_prev")
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = max(0, self.current_page - 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="page_next")
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = min(len(self.embeds) - 1, self.current_page + 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
-
-
-class BattleLogView(discord.ui.View):
-    def __init__(self, offenses, defenses, display_name, target_tag, mode_name):
-        super().__init__(timeout=300)
-        self.offenses = offenses
-        self.defenses = defenses
-        self.display_name = display_name
-        self.target_tag = target_tag
-        self.mode_name = mode_name
-        
-        self.current_page = 0
-        self.view_mode = "offense" if offenses else "defense"
-        
-        self.chunk_size = 2  
-        
-        self.update_state()
-
-    def get_current_data(self):
-        return self.offenses if self.view_mode == "offense" else self.defenses
-
-    def update_state(self):
-        data = self.get_current_data()
-        max_pages = max(1, (len(data) + self.chunk_size - 1) // self.chunk_size)
-        self.current_page = min(self.current_page, max_pages - 1)
-
-        self.prev_button.disabled = self.current_page <= 0
-        self.next_button.disabled = self.current_page >= max_pages - 1
-
-        self.offense_btn.style = discord.ButtonStyle.success if self.view_mode == "offense" else discord.ButtonStyle.secondary
-        self.defense_btn.style = discord.ButtonStyle.danger if self.view_mode == "defense" else discord.ButtonStyle.secondary
-
-        self.offense_btn.disabled = not self.offenses
-        self.defense_btn.disabled = not self.defenses
-
-    def build_embed(self):
-        data = self.get_current_data()
-        total_pages = max(1, (len(data) + self.chunk_size - 1) // self.chunk_size)
-
-        embed = discord.Embed(
-            title=f"{'🏆 Legend League' if self.mode_name == 'ranked' else '⚔️ Unranked'} {self.view_mode.capitalize()} Log: {self.display_name}",
-            color=discord.Color.brand_green() if self.view_mode == "offense" else discord.Color.brand_red()
-        )
-
-        chunk = data[self.current_page * self.chunk_size : (self.current_page + 1) * self.chunk_size]
-        value = "\n---\n".join(chunk) if chunk else f"No {self.view_mode} records found."
-
-        if len(value) > 4000: value = value[:4000] + "..."
-        
-        embed.description = value
-        embed.set_footer(text=f"Page {self.current_page + 1} of {total_pages} | Tag: #{self.target_tag}")
-        
-        return embed
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="bl_prev")
-    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page = max(0, self.current_page - 1)
-        self.update_state()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="⚔️ Offense", style=discord.ButtonStyle.success, custom_id="bl_off")
-    async def offense_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.view_mode = "offense"
-        self.current_page = 0
-        self.update_state()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="🛡️ Defense", style=discord.ButtonStyle.secondary, custom_id="bl_def")
-    async def defense_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.view_mode = "defense"
-        self.current_page = 0
-        self.update_state()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="bl_next")
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_page += 1
-        self.update_state()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 class SelfRoleView(discord.ui.View):
@@ -599,18 +403,22 @@ async def refresh_lb(bot):
     return embeds
 
 # --- SLASH COMMANDS ---
+
+@bot.tree.command(name='say', description="Anonymously make the bot say a message in a specific channel.")
+@app_commands.describe(channel="The channel where the bot should send the message.")
+@is_admin_or_owner()
+async def command_say_modal(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.send_modal(SayModal(target_channel=channel))
+
 @bot.tree.command(name='clan_info', description="Displays the clans in our alliance along with their links, types, and stats.")
 async def command_clan_info(interaction: discord.Interaction):
-    # Defer so the API calls don't timeout the slash command
     await interaction.response.defer()
 
-    # ⚠️ Put your EXACT file names here (e.g., "angrybirdsbanner.jpeg")
-    # Make sure these images are in the exact same folder as this Python script!
     alliance_clans = [
         {
             "tag": "#2QUVQR0LC", 
             "type": "Competitive clan",
-            "requirements": "TH17+, Skilled Attacker", # You can customize this
+            "requirements": "TH16+, Active Daily",
             "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2QUVQR0LC",
             "image_filename": "angrybirdsbanner.jpeg",
             "color": discord.Color.red()
@@ -618,7 +426,7 @@ async def command_clan_info(interaction: discord.Interaction):
         {
             "tag": "#2GCCRP2JY", 
             "type": "CWL Feeder clan",
-            "requirements": "None", 
+            "requirements": "TH14+",
             "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2GCCRP2JY",
             "image_filename": "nightbirdsbanner.jpeg",
             "color": discord.Color.purple()
@@ -626,7 +434,7 @@ async def command_clan_info(interaction: discord.Interaction):
         {
             "tag": "#2RYPQ0GRQ", 
             "type": "Ore wars/sidewars clan",
-            "requirements": "None", # You can customize this
+            "requirements": "Heroes down allowed",
             "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2RYPQ0GRQ",
             "image_filename": "elitesyndicatebanner.jpeg",
             "color": discord.Color.blue()
@@ -638,19 +446,18 @@ async def command_clan_info(interaction: discord.Interaction):
 
     for clan in alliance_clans:
         clean_tag = clan['tag'].replace('#', '%23')
-        # Fetching Clan stats from API
         status, clan_data = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{clean_tag}", COC_HEADERS)
         
         wins = clan_data.get('warWins', 0) if status == 200 else "N/A"
         streak = clan_data.get('warWinStreak', 0) if status == 200 else "N/A"
         league = clan_data.get('warLeague', {}).get('name', 'Unranked') if status == 200 else "N/A"
 
-        # 1. Create the Text Embed (Appears Second)
         text_embed = discord.Embed(
             description=(
                 f"**Type:** {clan['type']}\n"
                 f"**Requirements:** {clan['requirements']}\n"
                 f"**Clan League:** {league}\n"
+                f"**War Wins:** {wins}\n"
                 f"**Win Streak:** 🔥 {streak}\n"
                 f"[🔗 View in Game]({clan['link']})"
             ),
@@ -658,26 +465,19 @@ async def command_clan_info(interaction: discord.Interaction):
         )
         
         try:
-            # Package the local file so Discord can read it
             file = discord.File(clan['image_filename'], filename=clan['image_filename'])
             files_to_send.append(file)
             
-            # 2. Create the Image Embed (Appears First)
             img_embed = discord.Embed(color=clan['color'])
-            
-            # Tell the embed to use the attached file as its image
             img_embed.set_image(url=f"attachment://{clan['image_filename']}") 
             
-            # Add the Image embed BEFORE the Text embed to force the stacking order
             embeds_to_send.append(img_embed)
             embeds_to_send.append(text_embed)
             
         except FileNotFoundError:
-            # If the file is missing, we skip the image embed but still send the text
             text_embed.description = f"*(Error: Could not find image file `{clan['image_filename']}`)*\n\n" + text_embed.description
             embeds_to_send.append(text_embed)
 
-    # Send the embeds AND the packaged files together
     await interaction.followup.send(embeds=embeds_to_send, files=files_to_send)
 
 @bot.tree.command(name='setleaderboard', description="Set up the automated updating leaderboard in this channel.")
@@ -702,8 +502,8 @@ async def setup_roles(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎭 Self-Assign Roles",
         description="Click the buttons below to add or remove roles.\n\n"
-                    "⚔️ **ORE WARS** - Get pinged for Ore Wars.\n"
-                    "🛡️ **FC role** - Get pinged for Friendly Challenges(FC).",
+        "⚔️ **ORE WARS** - Get pinged for Ore Wars.\n"
+        "🛡️ **FC role** - Get pinged for Friendly Challenges(FC).",
         color=discord.Color.blurple()
     )
     await interaction.channel.send(embed=embed, view=SelfRoleView())
@@ -775,9 +575,9 @@ async def player_profile(interaction: discord.Interaction, player: str):
     await interaction.response.defer()
     if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
     
-    legend_stats_cache, armies_db = await load_json_file(LEGEND_STATS_FILE, {}), await load_json_file(ARMIES_DB_FILE, {}) 
-    p_dict, _, _, raw = await fetch_player_data(interaction.client.session, target_tag, COC_HEADERS, {}, legend_stats_cache, armies_db)
-    await asyncio.gather(save_json_file(LEGEND_STATS_FILE, legend_stats_cache), save_json_file(ARMIES_DB_FILE, armies_db))
+    legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {}) 
+    p_dict, _, _, raw = await fetch_player_data(interaction.client.session, target_tag, COC_HEADERS, {}, legend_stats_cache)
+    await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
 
     if raw:
         sw_count = (await load_json_file(SUPERWHOO_FILE, {})).get(f"#{target_tag}", {}).get("count", 0)
@@ -791,170 +591,6 @@ async def player_profile(interaction: discord.Interaction, player: str):
         embed.set_footer(text=f"Tag: #{target_tag}")
         await interaction.followup.send(embed=embed)
     else: await interaction.followup.send("❌ Could not find that player, or the API is currently unavailable.")
-
-@bot.tree.command(name='armies', description="Shows the armies a player is currently using.")
-@app_commands.autocomplete(player=player_autocomplete)
-@app_commands.choices(mode=[app_commands.Choice(name="Ranked", value="ranked"), app_commands.Choice(name="Unranked", value="unranked")])
-async def player_armies(interaction: discord.Interaction, player: str, mode: str = "ranked"):
-    await interaction.response.defer()
-    if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
-        
-    armies_db = await load_json_file(ARMIES_DB_FILE, {})
-    if target_tag in armies_db: migrate_armies(armies_db[target_tag])
-            
-    has_tracked = target_tag in armies_db and armies_db[target_tag].get(mode)
-    armies_to_show = {}
-    title_prefix = ""
-    
-    if has_tracked:
-        armies_to_show = armies_db[target_tag][mode]
-        title_prefix = "All-Time Tracked"
-        display_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f"#{target_tag}")
-    else:
-        status, log_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", COC_HEADERS)
-        if status == 403: return await interaction.followup.send("🔒 This player's battle log is private.")
-        if status != 200 or not log_data or 'items' not in log_data: return await interaction.followup.send("❌ Could not fetch battle log.")
-            
-        profile_status, profile_data = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}", COC_HEADERS)
-        display_name = profile_data.get('name', f"#{target_tag}") if profile_status == 200 else f"#{target_tag}"
-        
-        for b in log_data.get('items', []):
-            if b.get('attack') and 'armyShareCode' in b and ("ranked" if b.get('battleType') in ['legend', 'homeVillage'] else "unranked") == mode:
-                armies_to_show.setdefault(b['armyShareCode'], {"uses": 0, "total_dest": 0})
-                armies_to_show[b['armyShareCode']]["uses"] += 1; armies_to_show[b['armyShareCode']]["total_dest"] += b.get('destructionPercentage', 0)
-        title_prefix = "Recent Live"
-        
-    if display_name.lower() == "sam":
-        display_name = "/Sam\\"
-        
-    if not armies_to_show: return await interaction.followup.send(f"⚠️ No **{mode}** armies found for this player in their recent log.")
-        
-    sorted_armies = sorted(armies_to_show.items(), key=lambda x: x[1]['uses'], reverse=True)[:15]  # Cap at top 15 armies
-    embeds = []
-    
-    color = discord.Color.brand_green() if mode == "ranked" else discord.Color.orange()
-    main_title = f"⚔️ {title_prefix} {'Ranked' if mode == 'ranked' else 'Unranked (War/Friendly)'} Armies for {display_name}"
-    
-    for i, (code, stats) in enumerate(sorted_armies):
-        embed = discord.Embed(title=main_title, color=color)
-        comp = get_army_summary(code)
-        
-        desc_text = (
-            f"**Army {i+1}** (Used {stats['uses']} times)\n"
-            f"**Avg Destruction:** {stats['total_dest'] / stats['uses']:.1f}%\n\n"
-            f"**Composition:**\n{comp}\n\n"
-            f"[🔗 Click to Copy Army In-Game](https://link.clashofclans.com/en?action=CopyArmy&army={code})"
-        )
-        
-        if len(desc_text) > 4096:
-            desc_text = desc_text[:4090] + "..."
-            
-        embed.description = desc_text
-        embed.set_footer(text=f"Page {i+1} of {len(sorted_armies)}")
-        embeds.append(embed)
-
-    if len(embeds) > 1:
-        view = EmbedPaginator(embeds) 
-        await interaction.followup.send(embed=embeds[0], view=view)
-    else:
-        await interaction.followup.send(embed=embeds[0])
-
-
-
-# --- BATTLE LOG COMMAND ---
-@bot.tree.command(name='battle_log', description="View recent offensive and defensive battle logs for a player.")
-@app_commands.autocomplete(player=player_autocomplete)
-@app_commands.choices(mode=[
-    app_commands.Choice(name="Ranked (Legend Only)", value="ranked"),
-    app_commands.Choice(name="Unranked", value="unranked")
-])
-async def command_battle_log(interaction: discord.Interaction, player: str, mode: str = "ranked"):
-    await interaction.response.defer()
-    
-    if not (target_tag := await resolve_player_input(player)):
-        return await interaction.followup.send("❌ Please provide a valid player name or tag.")
-
-    status, log_data = await safe_fetch(
-        interaction.client.session, 
-        f"https://api.clashofclans.com/v1/players/%23{target_tag}/battlelog", 
-        COC_HEADERS
-    )
-    
-    if status == 403: 
-        return await interaction.followup.send("🔒 This player's battle log is private.")
-    if status != 200 or not log_data or 'items' not in log_data: 
-        return await interaction.followup.send("❌ Could not fetch the battle log or the log is empty.")
-
-    name_cache = await load_json_file(NAME_CACHE_FILE, {})
-    display_name = name_cache.get(target_tag, f"#{target_tag}")
-    if display_name.lower() == "sam":
-        display_name = "/Sam\\"
-    
-    # Pass 1: Find any opponents missing their names and fetch them
-    missing_tags = set()
-    for b in log_data.get('items', []):
-        is_attack = b.get('attack', False)
-        opponent_dict = b.get('defender', {}) if is_attack else b.get('attacker', {})
-        if 'name' not in opponent_dict and 'opponentPlayerTag' in b:
-            tag = b['opponentPlayerTag'].replace('#', '').upper()
-            if tag not in name_cache:
-                missing_tags.add(tag)
-
-    if missing_tags:
-        async def fetch_missing_name(tag):
-            s, d = await safe_fetch(interaction.client.session, f"https://api.clashofclans.com/v1/players/%23{tag}", COC_HEADERS)
-            return tag, d.get('name') if s == 200 and d else None
-
-        results = await asyncio.gather(*(fetch_missing_name(t) for t in missing_tags))
-        new_names_found = False
-        for tag, name in results:
-            if name:
-                name_cache[tag] = name
-                new_names_found = True
-        if new_names_found:
-            await save_json_file(NAME_CACHE_FILE, name_cache)
-
-    # Pass 2: Build the embeds
-    offenses = []
-    defenses = []
-    
-    for b in log_data.get('items', []):
-        is_ranked = b.get('battleType') == 'legend'
-        
-        if (mode == "ranked" and not is_ranked) or (mode == "unranked" and is_ranked):
-            continue
-            
-        dest = b.get('destructionPercentage', 0)
-        stars = b.get('stars', 0)
-        is_attack = b.get('attack', False)
-        army_code = b.get('armyShareCode')
-        
-        opponent_dict = b.get('defender', {}) if is_attack else b.get('attacker', {})
-        opponent_name = opponent_dict.get('name')
-
-        if not opponent_name and 'opponentPlayerTag' in b:
-            tag = b['opponentPlayerTag'].replace('#', '').upper()
-            opponent_name = name_cache.get(tag, f"#{tag}") # Fallback to the tag if the API fetch failed
-            
-        if not opponent_name:
-            opponent_name = "Unknown"
-        
-        army_text = get_army_summary(army_code) if army_code else "Unknown / Not Exposed by API"
-        star_display = "⭐" * stars if stars > 0 else "0 ⭐"
-
-        entry = f"**Vs:** {discord.utils.escape_markdown(opponent_name)} | {dest}% | {star_display}\n{army_text}\n"
-        
-        if is_attack:
-            offenses.append(entry)
-        else:
-            defenses.append(entry)
-
-    if not offenses and not defenses:
-        return await interaction.followup.send(f"⚠️ No recent {mode} records found in the API log.")
-
-    view = BattleLogView(offenses, defenses, display_name, target_tag, mode)
-    await interaction.followup.send(embed=view.build_embed(), view=view)
-
 
 # --- SUPERWHOO COMMAND ---
 @bot.tree.command(name='superwhoo', description="View the Superwhoo Leaderboard or a specific player's painful misses.")
@@ -998,22 +634,6 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
     embed = discord.Embed(title="🏆 The Superwhoo Leaderboard 🏆", description="The ultimate wall of shame for 97-99% war attacks (Normal & CWL).", color=discord.Color.red())
     embed.add_field(name="Rankings", value=desc_text, inline=False)
     await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name='auto_emojis', description="Generates the TROOP_EMOJIS dictionary code using your server's emojis.")
-@is_admin_or_owner()
-async def auto_emojis(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    if not interaction.guild: return await interaction.followup.send("❌ You must run this command inside a server, not in DMs.")
-        
-    base_troops = {0: "barbarian", 1: "archer", 2: "goblin", 3: "giant", 4: "wallbreaker", 5: "balloon", 6: "wizard", 7: "healer", 8: "dragon", 9: "pekka", 10: "minion", 11: "hogrider", 12: "valkyrie", 13: "golem", 15: "witch", 17: "lavahound", 22: "bowler", 23: "babydragon", 24: "miner", 26: "superbarbarian", 27: "superarcher", 28: "sneakygoblin", 35: "icehound", 51: "wallwrecker", 52: "battleblimp", 53: "yeti", 57: "superwallbreaker", 58: "icegolem", 59: "electrodragon", 62: "stoneslammer", 63: "infernodragon", 65: "dragonrider", 66: "superminion", 75: "siegebarracks", 80: "rocketballoon", 82: "headhunter", 87: "loglauncher", 91: "flameflinger", 92: "battledrill", 95: "electrotitan", 97: "apprenticewarden", 110: "rootrider", 132: "thrower", 147: "meteorgolem", 150: "furnace", 177: "smasher"}
-    server_emojis = {e.name.lower().replace("avatar_", "").replace("_", ""): str(e) for e in interaction.guild.emojis}
-    
-    matches_found, output_str = 0, "TROOP_EMOJIS = {\n"
-    for t_id, name in base_troops.items():
-        output_str += f'    {t_id}: "{server_emojis.get(name, name)}",\n'
-        if name in server_emojis: matches_found += 1
-            
-    await interaction.followup.send(f"✅ Found **{matches_found}** matching emojis! Paste contents into script.", file=discord.File(io.BytesIO((output_str + "}").encode('utf-8')), filename="troop_emojis.py"))
 
 @bot.command(name='sync')
 async def force_sync(ctx):
