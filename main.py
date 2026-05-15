@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import aiohttp, asyncio, json, os, time, logging, contextlib, datetime, io
+import aiohttp, asyncio, json, os, time, logging, contextlib, datetime, io, random
 from dotenv import load_dotenv
 
 # --- LOGGING SETUP ---
@@ -12,6 +12,26 @@ load_dotenv()
 PLAYERS_FILE, CONFIG_FILE, TROPHY_CACHE_FILE = 'players.json', 'lb_config.json', 'trophy_cache.json'
 LEGEND_STATS_FILE, SUPERWHOO_FILE = 'legend_stats.json', 'superwhoo_stats.json'
 NAME_CACHE_FILE = 'name_cache.json'
+GIVEAWAY_FILE = 'giveaways.json'
+
+# --- AUTOMATIC FILE CREATOR ---
+def ensure_files_exist():
+    files_with_defaults = {
+        PLAYERS_FILE: [],
+        CONFIG_FILE: {},
+        TROPHY_CACHE_FILE: {},
+        LEGEND_STATS_FILE: {},
+        SUPERWHOO_FILE: {},
+        NAME_CACHE_FILE: {},
+        GIVEAWAY_FILE: {}
+    }
+    for filepath, default_data in files_with_defaults.items():
+        if not os.path.exists(filepath):
+            with open(filepath, 'w') as f:
+                json.dump(default_data, f, indent=4)
+            logger.info(f"Created missing configuration file: {filepath}")
+
+ensure_files_exist()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 COC_TOKEN = os.getenv('COC_TOKEN')
@@ -36,19 +56,16 @@ LEAGUE_EMOJIS = {
     "Titan League 25": "<:titan_league_25:1485298109981397163>", "Titan League 26": "<:titan_league_26:1485298115006300291>", "Titan League 27": "<:titan_league_27:1485298118416269425>",
     "Dragon League 28": "<:dragon_league_28:1485298122505846958>", "Dragon League 29": "<:dragon_league_29:1485298126935031958>", "Dragon League 30": "<:dragon_league_30:1485298131863077104>",
     "Electro League 31": "<:electro_league_31:1485298134958735360>", "Electro League 32": "<:electro_league_32:1485298138066714794>", "Electro League 33": "<:electro_league_33:1485298142776918126>",
-    # PASTE YOUR CUSTOM LEGEND EMOJIS BELOW
-    "Legend League 3": "<:legend_league:1485298146186625205>", 
-    "Legend League 2": "<:legend_league:1485298146186625205>", 
-    "Legend League 1": "<:legend_league:1485298146186625205>"  
+    "Legend League 3": "<:legend_league:1485298146186625205>",
+    "Legend League 2": "<:legend_league:1485298146186625205>",
+    "Legend League 1": "<:legend_league:1485298146186625205>"
 }
 
-# The enumerate order ensures Legend 1 (highest in dict) has the highest weight for sorting
 LEAGUE_WEIGHTS = {name: i for i, name in enumerate(LEAGUE_EMOJIS.keys(), start=1)}
 
 TIER_ID_TO_NAME = {
     105000001: "Skeleton League 1", 105000034: "Legend League"
 }
-# We populate this dynamically to ensure all previous IDs map correctly
 for i in range(1, 34): TIER_ID_TO_NAME[105000000 + i] = list(LEAGUE_EMOJIS.keys())[i-1]
 
 # --- FILE HELPERS ---
@@ -76,7 +93,7 @@ async def resolve_player_input(input_str: str) -> str:
 
 async def player_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     name_cache = await load_json_file(NAME_CACHE_FILE, {})
-    return [app_commands.Choice(name=f"{name} (#{tag})", value=tag) for tag, name in name_cache.items() 
+    return [app_commands.Choice(name=f"{name} (#{tag})", value=tag) for tag, name in name_cache.items()
             if current.lower() in name.lower() or current.lower() in tag.lower()][:25]
 
 # --- FORMATTING HELPERS ---
@@ -117,8 +134,7 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
         if status == 200 and d:
             current_trophies = d.get('trophies', 0)
             l_name = TIER_ID_TO_NAME.get(d.get('leagueTier', {}).get('id'), "Unranked")
-            
-            # --- LEGEND SPLITTING LOGIC ---
+
             if l_name == "Legend League" or current_trophies >= 5000:
                 if current_trophies >= 5600: l_name = "Legend League 1"
                 elif current_trophies >= 5300: l_name = "Legend League 2"
@@ -126,13 +142,13 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
 
             weight = LEAGUE_WEIGHTS.get(l_name, 0)
             legend_log = None
-            
-            if weight >= 34: 
+
+            if weight >= 34:
                 log_status, log_data = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog", headers)
                 if log_status == 200 and log_data:
                     p_stats = legend_stats_cache.setdefault(tag, {"seen_battles": [], "initialized": False, "off_count": 0, "off_trophies": 0, "def_count": 0, "def_trophies": 0, "last_reset": None})
                     now_str = (datetime.datetime.now(datetime.timezone.utc).date() if datetime.datetime.now(datetime.timezone.utc).hour >= 5 else (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).date()).isoformat()
-                    
+
                     if p_stats.get("last_reset") != now_str:
                         p_stats.update({"off_count": 0, "off_trophies": 0, "def_count": 0, "def_trophies": 0, "last_reset": now_str})
 
@@ -162,13 +178,37 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
         return None, tag, None, None
 
 # --- UI & VIEWS ---
+class GiveawayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎉 Enter Giveaway", style=discord.ButtonStyle.success, custom_id="giveaway_join_btn")
+    async def join_giveaway(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gw_data = await load_json_file(GIVEAWAY_FILE, {})
+        msg_id_str = str(interaction.message.id)
+
+        if msg_id_str not in gw_data or not gw_data[msg_id_str].get("active", False):
+            return await interaction.response.send_message("❌ This giveaway has already ended!", ephemeral=True)
+
+        entrants = gw_data[msg_id_str].get("entrants", [])
+
+        if interaction.user.id in entrants:
+            return await interaction.response.send_message("⚠️ You have already entered this giveaway!", ephemeral=True)
+
+        entrants.append(interaction.user.id)
+        gw_data[msg_id_str]["entrants"] = entrants
+        await save_json_file(GIVEAWAY_FILE, gw_data)
+
+        await interaction.response.send_message("✅ You have successfully entered the giveaway! Good luck!", ephemeral=True)
+
+
 async def build_leaderboard_embeds(bot):
     players = await load_json_file(PLAYERS_FILE, [])
     if not players: return [discord.Embed(title="Server Leaderboard", description="Tracker is empty.", color=discord.Color.gold())], set(), []
-    
+
     t_cache, l_cache, n_cache = await asyncio.gather(load_json_file(TROPHY_CACHE_FILE, {}), load_json_file(LEGEND_STATS_FILE, {}), load_json_file(NAME_CACHE_FILE, {}))
     new_cache, data_list, clans, sem = {}, [], set(), asyncio.Semaphore(3)
-    
+
     results = await asyncio.gather(*(fetch_player_data(bot.session, tag, COC_HEADERS, t_cache, l_cache, sem) for tag in players))
     for p, tag, trop, raw in results:
         if p:
@@ -178,7 +218,7 @@ async def build_leaderboard_embeds(bot):
 
     await asyncio.gather(save_json_file(TROPHY_CACHE_FILE, new_cache), save_json_file(LEGEND_STATS_FILE, l_cache), save_json_file(NAME_CACHE_FILE, n_cache))
     data_list.sort(key=lambda x: (x['league_weight'], x['trophies']), reverse=True)
-    
+
     embeds = []
     for i in range(0, max(1, len(data_list)), 20):
         desc = ""
@@ -194,12 +234,13 @@ async def build_leaderboard_embeds(bot):
         embeds.append(embed)
     return embeds, clans, players
 
+
 class LeaderboardView(discord.ui.View):
     def __init__(self, bot, embeds=None, page=0, msg_id=None):
         super().__init__(timeout=None)
         self.bot, self.embeds, self.page, self.msg_id = bot, embeds, page, msg_id
         if embeds: self.update_btns()
-    
+
     def update_btns(self):
         self.prev.disabled = self.page <= 0
         self.next.disabled = self.page >= len(self.embeds) - 1
@@ -222,7 +263,7 @@ class SayModal(discord.ui.Modal, title='Make the bot speak'):
         self.target_channel = target_channel
     async def on_submit(self, interaction: discord.Interaction):
         await self.target_channel.send(self.message_input.value)
-        await interaction.response.send_message(f"✅ Ghost message sent!", ephemeral=True)
+        await interaction.response.send_message("✅ Ghost message sent!", ephemeral=True)
 
 
 class SelfRoleView(discord.ui.View):
@@ -230,8 +271,9 @@ class SelfRoleView(discord.ui.View):
         super().__init__(timeout=None)
 
     async def handle_role(self, interaction: discord.Interaction, role_name: str):
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
         if not role: return await interaction.response.send_message(f"❌ The role **{role_name}** could not be found.", ephemeral=True)
-            
+
         if role in interaction.user.roles:
             await interaction.user.remove_roles(role)
             await interaction.response.send_message(f"➖ Successfully removed the **{role_name}** role.", ephemeral=True)
@@ -262,30 +304,31 @@ class TicketCloseView(discord.ui.View):
         except:
             pass
 
+
 class TicketModal(discord.ui.Modal):
     def __init__(self, clan_name: str):
         super().__init__(title=f"Application: {clan_name}")
         self.clan_name = clan_name
 
     q1 = discord.ui.TextInput(
-        label="1 - Player Tag - Player Name - Town Hall", 
-        style=discord.TextStyle.paragraph, 
+        label="1 - Player Tag - Player Name - Town Hall",
+        style=discord.TextStyle.paragraph,
         placeholder="#TAG\nName\nTH 16",
         required=True
     )
     q2 = discord.ui.TextInput(
-        label="2 - What are your game interests", 
-        style=discord.TextStyle.short, 
+        label="2 - What are your game interests",
+        style=discord.TextStyle.short,
         placeholder="CWL, Trophy Pushing, Farming",
         required=True
     )
     q3 = discord.ui.TextInput(
-        label="3 - Where did you hear about us", 
+        label="3 - Where did you hear about us",
         style=discord.TextStyle.short,
         required=True
     )
     q4 = discord.ui.TextInput(
-        label="4 - Language(s) - Location - Age", 
+        label="4 - Language(s) - Location - Age",
         style=discord.TextStyle.paragraph,
         placeholder="English\nUS\n23",
         required=True
@@ -294,51 +337,43 @@ class TicketModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
-        
-        # 1. Fetch or create the "Tickets" category
+
         category = discord.utils.get(guild.categories, name="Tickets")
         if not category:
             category = await guild.create_category("Tickets")
 
-        # 2. Setup permissions for the private channel
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
         }
 
-        # 3. Create the ticket channel
         channel_name = f"ticket-{interaction.user.name.lower()}"
         ticket_channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
 
-        # 4. Create the Welcome Embed (Green Side Bar)
         welcome_embed = discord.Embed(
             description=f"Thank you for your application to **{self.clan_name}**!\n\nOur team will be with you as soon as possible.\n\nTo close this ticket react with 🔒",
             color=discord.Color.brand_green()
         )
-        
-        # 5. Create the Answers Embed (Dark Gray formatting)
+
+        # FIX: all f-strings are on a single line, no literal newlines inside them
         answers_embed = discord.Embed(color=discord.Color.dark_embed())
         answers_embed.add_field(name="1 - Player Tag - Player Name - Town Hall", value=f"```\n{self.q1.value}\n```", inline=False)
         answers_embed.add_field(name="2 - What are your game interests", value=f"```\n{self.q2.value}\n```", inline=False)
         answers_embed.add_field(name="3 - Where did you hear about us", value=f"```\n{self.q3.value}\n```", inline=False)
         answers_embed.add_field(name="4 - Language(s) - Location - Age", value=f"```\n{self.q4.value}\n```", inline=False)
 
-        # 6. Customize Role Pings based on clan (Replace 000000000000000000 with actual Role IDs in your server)
         role_ping = ""
         if self.clan_name == "Angry Birds":
-            role_ping = "" # e.g., "<@&123456789012345678> <@&987654321098765432>"
+            role_ping = ""  # e.g., "<@&123456789012345678>"
         elif self.clan_name == "Night Birds":
-            role_ping = "" 
+            role_ping = ""
         elif self.clan_name == "Elite Syndicate":
             role_ping = ""
 
-        # 7. Send the messages to the new channel
         ping_msg = f"{interaction.user.mention} {role_ping}"
         await ticket_channel.send(content=ping_msg, embed=welcome_embed)
         await ticket_channel.send(embed=answers_embed, view=TicketCloseView())
-
-        # 8. Let the user know it was created
         await interaction.followup.send(f"✅ Ticket created! Please head over to {ticket_channel.mention}", ephemeral=True)
 
 
@@ -370,21 +405,25 @@ class CoCBot(commands.Bot):
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
-        
+
         # Register Persistent Views so buttons work after restarts
         self.add_view(LeaderboardView(self))
         self.add_view(SelfRoleView())
         self.add_view(TicketLauncherView())
         self.add_view(TicketCloseView())
-        
+        self.add_view(GiveawayView())
+
         await self.tree.sync()
+        # FIX: module-level tasks, not self.
         auto_lb.start()
+        giveaway_checker.start()
 
     async def close(self):
         if self.session: await self.session.close()
         await super().close()
 
 bot = CoCBot()
+
 
 @tasks.loop(minutes=5)
 async def auto_lb():
@@ -397,7 +436,88 @@ async def auto_lb():
     except: pass
 
 
+@tasks.loop(minutes=1)
+async def giveaway_checker():
+    await bot.wait_until_ready()
+    gw_data = await load_json_file(GIVEAWAY_FILE, {})
+    current_time = int(time.time())
+    changes_made = False
+
+    for msg_id, data in gw_data.items():
+        if data.get("active") and current_time >= data.get("end_time"):
+            try:
+                channel = bot.get_channel(data["channel_id"]) or await bot.fetch_channel(data["channel_id"])
+                message = await channel.fetch_message(int(msg_id))
+
+                entrants = data.get("entrants", [])
+                winners_count = data.get("winners", 1)
+
+                if not entrants:
+                    await channel.send(f"Nobody entered the giveaway for **{data['prize']}**! 😢")
+                else:
+                    actual_winners = min(len(entrants), winners_count)
+                    winners = random.sample(entrants, actual_winners)
+                    winner_mentions = ", ".join(f"<@{w}>" for w in winners)
+                    await channel.send(f"🎉 Congratulations {winner_mentions}! You won **{data['prize']}**! (Hosted by <@{data['host_id']}>)")
+
+                ended_embed = message.embeds[0]
+                ended_embed.color = discord.Color.red()
+                ended_embed.title = "🎊 Giveaway Ended 🎊"
+                view = discord.ui.View()
+                btn = discord.ui.Button(label="Giveaway Ended", style=discord.ButtonStyle.secondary, disabled=True)
+                view.add_item(btn)
+                await message.edit(embed=ended_embed, view=view)
+
+            except Exception as e:
+                logger.error(f"Failed to end giveaway {msg_id}: {e}")
+
+            data["active"] = False
+            changes_made = True
+
+    if changes_made:
+        await save_json_file(GIVEAWAY_FILE, gw_data)
+
+
+# --- PREFIX COMMANDS ---
+@bot.command(name='sync')
+async def sync_tree(ctx):
+    if ctx.author.id == OWNER_ID or ctx.author.guild_permissions.administrator:
+        bot.tree.copy_global_to(guild=ctx.guild)
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await ctx.send(f"✅ Command tree synced! ({len(synced)} commands)")
+    else:
+        await ctx.send("❌ You do not have permission to run this command.")
+
+
 # --- SLASH COMMANDS ---
+
+@bot.tree.command(name='giveaway', description="Start a restart-proof giveaway.")
+@app_commands.describe(prize="What are you giving away?", duration_minutes="How many minutes should it run?", winners="How many winners?")
+@is_admin_or_owner()
+async def start_giveaway(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
+    end_time = int(time.time()) + (duration_minutes * 60)
+
+    embed = discord.Embed(
+        title="🎉 New Giveaway! 🎉",
+        description=f"**Prize:** {prize}\n**Winners:** {winners}\n**Hosted by:** {interaction.user.mention}\n\n**Ends:** <t:{end_time}:R> (<t:{end_time}:f>)",
+        color=discord.Color.brand_green()
+    )
+
+    await interaction.response.send_message("✅ Giveaway started!", ephemeral=True)
+    msg = await interaction.channel.send(embed=embed, view=GiveawayView())
+
+    gw_data = await load_json_file(GIVEAWAY_FILE, {})
+    gw_data[str(msg.id)] = {
+        "channel_id": interaction.channel_id,
+        "host_id": interaction.user.id,
+        "prize": prize,
+        "end_time": end_time,
+        "winners": winners,
+        "entrants": [],
+        "active": True
+    }
+    await save_json_file(GIVEAWAY_FILE, gw_data)
+
 
 @bot.tree.command(name='setup_tickets', description="Set up the ticket application panel.")
 @is_admin_or_owner()
@@ -408,12 +528,9 @@ async def setup_tickets(interaction: discord.Interaction):
                     "🦅 - Angry Birds\n"
                     "🦉 - Night Birds\n"
                     "🛡️ - Elite Syndicate\n",
-        color=discord.Color.dark_theme()
+        color=discord.Color.brand_green()
     )
-    # Side bar color matching the image
-    embed.color = discord.Color.brand_green() 
     embed.set_footer(text="Application System")
-    
     await interaction.channel.send(embed=embed, view=TicketLauncherView())
     await interaction.response.send_message("✅ Ticket panel deployed!", ephemeral=True)
 
@@ -424,7 +541,7 @@ async def command_clan_info(interaction: discord.Interaction):
 
     alliance_clans = [
         {
-            "tag": "#2QUVQR0LC", 
+            "tag": "#2QUVQR0LC",
             "type": "Competitive clan",
             "requirements": "TH16+, Active Daily",
             "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2QUVQR0LC",
@@ -432,7 +549,7 @@ async def command_clan_info(interaction: discord.Interaction):
             "color": discord.Color.red()
         },
         {
-            "tag": "#2GCCRP2JY", 
+            "tag": "#2GCCRP2JY",
             "type": "CWL Feeder clan",
             "requirements": "TH14+",
             "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2GCCRP2JY",
@@ -440,7 +557,7 @@ async def command_clan_info(interaction: discord.Interaction):
             "color": discord.Color.purple()
         },
         {
-            "tag": "#2RYPQ0GRQ", 
+            "tag": "#2RYPQ0GRQ",
             "type": "Ore wars/sidewars clan",
             "requirements": "Heroes down allowed",
             "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2RYPQ0GRQ",
@@ -455,7 +572,7 @@ async def command_clan_info(interaction: discord.Interaction):
     for clan in alliance_clans:
         clean_tag = clan['tag'].replace('#', '%23')
         status, clan_data = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{clean_tag}", COC_HEADERS)
-        
+
         wins = clan_data.get('warWins', 0) if status == 200 else "N/A"
         streak = clan_data.get('warWinStreak', 0) if status == 200 else "N/A"
         league = clan_data.get('warLeague', {}).get('name', 'Unranked') if status == 200 else "N/A"
@@ -471,28 +588,27 @@ async def command_clan_info(interaction: discord.Interaction):
             ),
             color=clan['color']
         )
-        
+
         try:
             file = discord.File(clan['image_filename'], filename=clan['image_filename'])
             files_to_send.append(file)
-            
             img_embed = discord.Embed(color=clan['color'])
-            img_embed.set_image(url=f"attachment://{clan['image_filename']}") 
-            
+            img_embed.set_image(url=f"attachment://{clan['image_filename']}")
             embeds_to_send.append(img_embed)
             embeds_to_send.append(text_embed)
-            
         except FileNotFoundError:
             text_embed.description = f"*(Error: Could not find image file `{clan['image_filename']}`)*\n\n" + text_embed.description
             embeds_to_send.append(text_embed)
 
     await interaction.followup.send(embeds=embeds_to_send, files=files_to_send)
 
+
 @bot.tree.command(name='say', description="Anonymously make the bot say a message in a specific channel.")
 @app_commands.describe(channel="The channel where the bot should send the message.")
 @is_admin_or_owner()
 async def command_say_modal(interaction: discord.Interaction, channel: discord.TextChannel):
     await interaction.response.send_modal(SayModal(target_channel=channel))
+
 
 @bot.tree.command(name='setleaderboard', description="Set up the automated updating leaderboard in this channel.")
 @is_admin_or_owner()
@@ -510,27 +626,20 @@ async def set_leaderboard(interaction: discord.Interaction):
     await save_json_file(CONFIG_FILE, {"channel_id": interaction.channel_id, "message_id": lb_message.id})
     await interaction.followup.send("✅ Automated leaderboard successfully set up in this channel!", ephemeral=True)
 
+
 @bot.tree.command(name='setup_roles', description="Set up the self-assignable roles message in this channel.")
 @is_admin_or_owner()
 async def setup_roles(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎭 Self-Assign Roles",
         description="Click the buttons below to add or remove roles.\n\n"
-        "⚔️ **ORE WARS** - Get pinged for Ore Wars.\n"
-        "🛡️ **FC role** - Get pinged for Friendly Challenges(FC).",
+                    "⚔️ **ORE WARS** - Get pinged for Ore Wars.\n"
+                    "🛡️ **FC role** - Get pinged for Friendly Challenges(FC).",
         color=discord.Color.blurple()
     )
     await interaction.channel.send(embed=embed, view=SelfRoleView())
     await interaction.response.send_message("✅ Self-assign roles menu has been deployed!", ephemeral=True)
 
-@bot.command(name='sync')
-async def sync_tree(ctx):
-    # Check if the user is the owner or an admin
-    if ctx.author.id == OWNER_ID or ctx.author.guild_permissions.administrator:
-        synced = await bot.tree.sync()
-        await ctx.send(f"✅ Command tree synced! ({len(synced)} commands)")
-    else:
-        await ctx.send("❌ You do not have permission to run this command.")
 
 @bot.tree.command(name='add', description="Add a player to the tracker.")
 @is_admin_or_owner()
@@ -546,12 +655,13 @@ async def add_p(interaction, tag: str):
         else: await interaction.followup.send("Already added.")
     else: await interaction.followup.send("API Error.")
 
+
 @bot.tree.command(name='add_clan', description="Add all members of a Clash of Clans clan to the tracker.")
 @is_admin_or_owner()
 async def add_clan(interaction: discord.Interaction, clan_tag: str):
     await interaction.response.defer(ephemeral=True)
     status, data = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/%23{clan_tag.strip().lstrip('#').upper()}", COC_HEADERS)
-    
+
     if status == 200 and data:
         players, name_cache, added_count = await load_json_file(PLAYERS_FILE, []), await load_json_file(NAME_CACHE_FILE, {}), 0
         for m in data.get('memberList', []):
@@ -563,6 +673,7 @@ async def add_clan(interaction: discord.Interaction, clan_tag: str):
             await interaction.followup.send(f"✅ Successfully added **{added_count}** new members from **{data.get('name', 'Unknown Clan')}**!")
         else: await interaction.followup.send(f"⚠️ All members of **{data.get('name', 'Unknown Clan')}** are already in the tracker.")
     else: await interaction.followup.send("❌ Clan not found or API is rate-limiting.")
+
 
 @bot.tree.command(name='remove', description="Remove a player from the server tracker.")
 @app_commands.autocomplete(player=player_autocomplete)
@@ -576,6 +687,7 @@ async def remove_player(interaction: discord.Interaction, player: str):
         await interaction.followup.send(f"🗑️ Removed **#{target_tag}** from the server tracker.")
     else: await interaction.followup.send("⚠️ Player is not currently in the server tracker.")
 
+
 @bot.tree.command(name='leaderboard', description="Manually fetch the current server leaderboard.")
 @app_commands.checks.cooldown(1, 300, key=lambda i: i.guild_id)
 async def command_leaderboard(interaction: discord.Interaction):
@@ -585,13 +697,14 @@ async def command_leaderboard(interaction: discord.Interaction):
     msg = await interaction.followup.send(embed=embeds[0], view=view, wait=True)
     view.msg_id = msg.id; bot.lb_pages[msg.id] = 0
 
+
 @bot.tree.command(name='profile', description="Look up a specific Clash of Clans player profile.")
 @app_commands.autocomplete(player=player_autocomplete)
 async def player_profile(interaction: discord.Interaction, player: str):
     await interaction.response.defer()
     if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
-    
-    legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {}) 
+
+    legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
     p_dict, _, _, raw = await fetch_player_data(bot.session, target_tag, COC_HEADERS, {}, legend_stats_cache)
     await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
 
@@ -608,6 +721,7 @@ async def player_profile(interaction: discord.Interaction, player: str):
         await interaction.followup.send(embed=embed)
     else: await interaction.followup.send("❌ Could not find that player, or the API is currently unavailable.")
 
+
 @bot.tree.command(name='superwhoo', description="View the Superwhoo Leaderboard or a specific player's painful misses.")
 @app_commands.autocomplete(player=player_autocomplete)
 async def command_superwhoo(interaction: discord.Interaction, player: str = None):
@@ -618,10 +732,10 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
     if player:
         if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
         p_data = superwhoo_data.get(f"#{target_tag}")
-        
+
         raw_name = (await load_json_file(NAME_CACHE_FILE, {})).get(target_tag, f'#{target_tag}')
         formatted_name = '/Sam\\' if raw_name.lower() == 'sam' else raw_name
-        
+
         if not p_data or p_data['count'] == 0: return await interaction.followup.send(f"✅ Great news! **{formatted_name}** has no recorded fails.")
 
         history_text = ""
@@ -629,12 +743,12 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
             parts = sig.split('_')
             try: time_str = datetime.datetime.strptime(parts[0], "%Y%m%dT%H%M%S.000Z").strftime("%b %d, %Y") if len(parts) >= 3 else "Unknown Date"
             except: time_str = "Unknown Date"
-            
+
             if len(parts) >= 6 and parts[4].isdigit():
                 star_display = "☆" * int(parts[4]) if int(parts[4]) > 0 else "0 ☆"
             else:
                 star_display = "?"
-                
+
             history_text += f"• **{f'{parts[5]}%' if len(parts) >= 6 else '97-99%'}** ({star_display}) *(War Ended: {time_str})*\n"
 
         if len(history_text) > 4000: history_text = history_text[:4000] + "...\n*(Showing latest 50)*"
@@ -650,12 +764,14 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
     embed.add_field(name="Rankings", value=desc_text, inline=False)
     await interaction.followup.send(embed=embed)
 
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandNotFound):
-        return 
+        return
     if not interaction.response.is_done():
         try: await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
         except: pass
+
 
 if __name__ == '__main__': bot.run(DISCORD_TOKEN)
