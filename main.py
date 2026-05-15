@@ -56,17 +56,15 @@ LEAGUE_EMOJIS = {
     "Titan League 25": "<:titan_league_25:1485298109981397163>", "Titan League 26": "<:titan_league_26:1485298115006300291>", "Titan League 27": "<:titan_league_27:1485298118416269425>",
     "Dragon League 28": "<:dragon_league_28:1485298122505846958>", "Dragon League 29": "<:dragon_league_29:1485298126935031958>", "Dragon League 30": "<:dragon_league_30:1485298131863077104>",
     "Electro League 31": "<:electro_league_31:1485298134958735360>", "Electro League 32": "<:electro_league_32:1485298138066714794>", "Electro League 33": "<:electro_league_33:1485298142776918126>",
-    "Legend League 3": "<:legend_league:1485298146186625205>",
-    "Legend League 2": "<:legend_league:1485298146186625205>",
-    "Legend League 1": "<:legend_league:1485298146186625205>"
+    "Legend League 3": "<:legend_3:1499823876601942216>",  # FIX: Update this ID to your actual Legend 3 emoji ID
+    "Legend League 2": "<:legend_2:1499822746924748881>",
+    "Legend League 1": "<:legend_1:1499819879296139374>"
 }
 
 LEAGUE_WEIGHTS = {name: i for i, name in enumerate(LEAGUE_EMOJIS.keys(), start=1)}
 
-TIER_ID_TO_NAME = {
-    105000001: "Skeleton League 1", 105000034: "Legend League"
-}
-for i in range(1, 34): TIER_ID_TO_NAME[105000000 + i] = list(LEAGUE_EMOJIS.keys())[i-1]
+TIER_ID_TO_NAME = {}
+for i in range(1, 37): TIER_ID_TO_NAME[105000000 + i] = list(LEAGUE_EMOJIS.keys())[i-1]
 
 # --- FILE HELPERS ---
 async def load_json_file(filepath, default):
@@ -97,8 +95,8 @@ async def player_autocomplete(interaction: discord.Interaction, current: str) ->
             if current.lower() in name.lower() or current.lower() in tag.lower()][:25]
 
 # --- FORMATTING HELPERS ---
-def format_name_strict(name, max_width=10):
-    if name and name.lower() == "sam": return "/Sam\\"
+def format_name_strict(name, max_width=16):
+    if name and name.lower() == "sam": return "/Sam\\".ljust(max_width)
     safe_name = name.replace('`', "'")
     return (safe_name[:max_width - 2] + "..").ljust(max_width) if len(safe_name) > max_width else safe_name.ljust(max_width)
 
@@ -133,13 +131,9 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
         status, d = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}", headers)
         if status == 200 and d:
             current_trophies = d.get('trophies', 0)
+            
+            # API dynamically resolves the tier
             l_name = TIER_ID_TO_NAME.get(d.get('leagueTier', {}).get('id'), "Unranked")
-
-            if l_name == "Legend League" or current_trophies >= 5000:
-                if current_trophies >= 5600: l_name = "Legend League 1"
-                elif current_trophies >= 5300: l_name = "Legend League 2"
-                else: l_name = "Legend League 3"
-
             weight = LEAGUE_WEIGHTS.get(l_name, 0)
             legend_log = None
 
@@ -199,6 +193,21 @@ class GiveawayView(discord.ui.View):
         gw_data[msg_id_str]["entrants"] = entrants
         await save_json_file(GIVEAWAY_FILE, gw_data)
 
+        # --- UPDATE EMBED WITH PARTICIPANT COUNT ---
+        if interaction.message.embeds:
+            embed = interaction.message.embeds[0]
+            # Find and update the Participants field
+            found = False
+            for i, field in enumerate(embed.fields):
+                if field.name == "Participants":
+                    embed.set_field_at(i, name="Participants", value=str(len(entrants)), inline=True)
+                    found = True
+                    break
+            if not found:
+                embed.add_field(name="Participants", value=str(len(entrants)), inline=True)
+            
+            await interaction.message.edit(embed=embed)
+
         await interaction.response.send_message("✅ You have successfully entered the giveaway! Good luck!", ephemeral=True)
 
 
@@ -223,11 +232,8 @@ async def build_leaderboard_embeds(bot):
     for i in range(0, max(1, len(data_list)), 20):
         desc = ""
         for j, p in enumerate(data_list[i:i + 20], start=i + 1):
-            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} [**`{format_name_strict(p['name'])}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})**`|{p['trophies']:>4}`**{TROPHY_EMOJI}"
-            if p['league_weight'] >= 34:
-                ll = p['legend_log']
-                if ll == "private": line += " | `🔒 Private`"
-                elif isinstance(ll, dict): line += f" | `+{ll['off_trophies']}{to_superscript(ll['off_count'])}".ljust(9) + f"|-{ll['def_trophies']}{to_superscript(ll['def_count'])}".ljust(7) + "`"
+            # Added TH number directly after the league emoji
+            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} **`{p['th']}`** [**`{format_name_strict(p['name'])}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})**`|{p['trophies']:>4}`**{TROPHY_EMOJI}"
             desc += line + p['delta'] + "\n"
         embed = discord.Embed(title="Server Leaderboard", description=desc, color=discord.Color.gold())
         embed.set_footer(text=f"Page {(i//20)+1}/{(len(data_list)+19)//20}")
@@ -281,11 +287,11 @@ class SelfRoleView(discord.ui.View):
             await interaction.user.add_roles(role)
             await interaction.response.send_message(f"➕ Successfully added the **{role_name}** role.", ephemeral=True)
 
-    @discord.ui.button(label="ORE WARS role", style=discord.ButtonStyle.primary, custom_id="role_btn_ore_wars", emoji="⚔️")
+    @discord.ui.button(label="ORE WARS", style=discord.ButtonStyle.primary, custom_id="role_btn_ore_wars", emoji="💎")
     async def btn_ore_wars(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "ORE WARS")
 
-    @discord.ui.button(label="Friendly Challenge role", style=discord.ButtonStyle.success, custom_id="role_btn_fc", emoji="🛡️")
+    @discord.ui.button(label="FC", style=discord.ButtonStyle.success, custom_id="role_btn_fc", emoji="⚔️")
     async def btn_fc(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_role(interaction, "Friendly Challenge")
 
@@ -356,7 +362,6 @@ class TicketModal(discord.ui.Modal):
             color=discord.Color.brand_green()
         )
 
-        # FIX: all f-strings are on a single line, no literal newlines inside them
         answers_embed = discord.Embed(color=discord.Color.dark_embed())
         answers_embed.add_field(name="1 - Player Tag - Player Name - Town Hall", value=f"```\n{self.q1.value}\n```", inline=False)
         answers_embed.add_field(name="2 - What are your game interests", value=f"```\n{self.q2.value}\n```", inline=False)
@@ -414,7 +419,6 @@ class CoCBot(commands.Bot):
         self.add_view(GiveawayView())
 
         await self.tree.sync()
-        # FIX: module-level tasks, not self.
         auto_lb.start()
         giveaway_checker.start()
 
@@ -463,6 +467,11 @@ async def giveaway_checker():
                 ended_embed = message.embeds[0]
                 ended_embed.color = discord.Color.red()
                 ended_embed.title = "🎊 Giveaway Ended 🎊"
+                # Update Participant count one last time for finality
+                for i, field in enumerate(ended_embed.fields):
+                    if field.name == "Participants":
+                        ended_embed.set_field_at(i, name="Participants", value=str(len(entrants)), inline=True)
+
                 view = discord.ui.View()
                 btn = discord.ui.Button(label="Giveaway Ended", style=discord.ButtonStyle.secondary, disabled=True)
                 view.add_item(btn)
@@ -491,17 +500,63 @@ async def sync_tree(ctx):
 
 # --- SLASH COMMANDS ---
 
-@bot.tree.command(name='giveaway', description="Start a restart-proof giveaway.")
-@app_commands.describe(prize="What are you giving away?", duration_minutes="How many minutes should it run?", winners="How many winners?")
+@bot.tree.command(name='help', description="Displays a list of all available bot commands.")
+async def command_help(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Angry Birb Command List",
+        description="Here are all the available commands for this bot.",
+        color=discord.Color.blurple()
+    )
+
+    general_cmds = (
+        "**`/clan_info`** - Displays alliance clans, links, types, and stats.\n"
+        "**`/leaderboard`** - Manually fetch the current server leaderboard.\n"
+        "**`/profile [player]`** - Look up a specific CoC player profile.\n"
+        "**`/superwhoo [player]`** - View the Superwhoo Leaderboard or a specific player's painful misses.\n"
+    )
+
+    admin_cmds = (
+        "**`!sync`** - Syncs slash commands to the guild (Prefix command).\n"
+        "**`/giveaway`** - Start a giveaway.\n"
+        "**`/setup_tickets`** - Set up the ticket application panel. (WIP)\n"
+        "**`/setup_self_roles`** - Set up the self-assignable roles message.\n"
+        "**`/set_leaderboard`** - Set up the automated updating leaderboard.\n"
+        "**`/say`** - Make the bot say a message in a specific channel.\n"
+        "**`/add [tag]`** - Add a player to the tracker.\n"
+        "**`/add_clan [tag]`** - Add all members of a clan to the tracker.\n"
+        "**`/remove [player]`** - Remove a player from the server tracker.\n"
+    )
+
+    embed.add_field(name="General Commands", value=general_cmds, inline=False)
+    embed.add_field(name="Admin & Owner Commands", value=admin_cmds, inline=False)
+    embed.set_footer(text="Admin commands require Administrator permissions or Bot Owner access.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name='giveaway', description="Start a giveaway.")
+@app_commands.describe(
+    prize="What are you giving away?", 
+    days="Duration in days", 
+    hours="Duration in hours", 
+    minutes="Duration in minutes", 
+    winners="How many winners?"
+)
 @is_admin_or_owner()
-async def start_giveaway(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
-    end_time = int(time.time()) + (duration_minutes * 60)
+async def start_giveaway(interaction: discord.Interaction, prize: str, days: int = 0, hours: int = 0, minutes: int = 0, winners: int = 1):
+    total_seconds = (days * 86400) + (hours * 3600) + (minutes * 60)
+    
+    if total_seconds <= 0:
+        return await interaction.response.send_message("❌ You must specify a duration greater than 0!", ephemeral=True)
+
+    end_time = int(time.time()) + total_seconds
 
     embed = discord.Embed(
         title="🎉 New Giveaway! 🎉",
         description=f"**Prize:** {prize}\n**Winners:** {winners}\n**Hosted by:** {interaction.user.mention}\n\n**Ends:** <t:{end_time}:R> (<t:{end_time}:f>)",
         color=discord.Color.brand_green()
     )
+    embed.add_field(name="Participants", value="0", inline=True)
 
     await interaction.response.send_message("✅ Giveaway started!", ephemeral=True)
     msg = await interaction.channel.send(embed=embed, view=GiveawayView())
@@ -519,7 +574,7 @@ async def start_giveaway(interaction: discord.Interaction, prize: str, duration_
     await save_json_file(GIVEAWAY_FILE, gw_data)
 
 
-@bot.tree.command(name='setup_tickets', description="Set up the ticket application panel.")
+@bot.tree.command(name='setup_tickets', description="Set up the ticket application panel. (WIP)")
 @is_admin_or_owner()
 async def setup_tickets(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -603,14 +658,14 @@ async def command_clan_info(interaction: discord.Interaction):
     await interaction.followup.send(embeds=embeds_to_send, files=files_to_send)
 
 
-@bot.tree.command(name='say', description="Anonymously make the bot say a message in a specific channel.")
+@bot.tree.command(name='say', description="Make the bot say a message in a specific channel.")
 @app_commands.describe(channel="The channel where the bot should send the message.")
 @is_admin_or_owner()
 async def command_say_modal(interaction: discord.Interaction, channel: discord.TextChannel):
     await interaction.response.send_modal(SayModal(target_channel=channel))
 
 
-@bot.tree.command(name='setleaderboard', description="Set up the automated updating leaderboard in this channel.")
+@bot.tree.command(name='set_leaderboard', description="Set up the automated updating leaderboard in this channel.")
 @is_admin_or_owner()
 async def set_leaderboard(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -627,14 +682,14 @@ async def set_leaderboard(interaction: discord.Interaction):
     await interaction.followup.send("✅ Automated leaderboard successfully set up in this channel!", ephemeral=True)
 
 
-@bot.tree.command(name='setup_roles', description="Set up the self-assignable roles message in this channel.")
+@bot.tree.command(name='setup_self_roles', description="Set up the self-assignable roles message in this channel.")
 @is_admin_or_owner()
 async def setup_roles(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🎭 Self-Assign Roles",
         description="Click the buttons below to add or remove roles.\n\n"
-                    "⚔️ **ORE WARS** - Get pinged for Ore Wars.\n"
-                    "🛡️ **FC role** - Get pinged for Friendly Challenges(FC).",
+                    "💎 **ORE WARS** - Get pinged for Ore Wars.\n"
+                    "⚔️ **FC** - Get pinged for Friendly Challenges (FC).",
         color=discord.Color.blurple()
     )
     await interaction.channel.send(embed=embed, view=SelfRoleView())
