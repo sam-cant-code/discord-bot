@@ -232,8 +232,8 @@ async def build_leaderboard_embeds(bot):
     for i in range(0, max(1, len(data_list)), 20):
         desc = ""
         for j, p in enumerate(data_list[i:i + 20], start=i + 1):
-            # Added TH number directly after the league emoji
-            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} **`{p['th']}`** [**`{format_name_strict(p['name'])}`**](https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={p['tag'].replace('#', '')})**`|{p['trophies']:>4}`**{TROPHY_EMOJI}"
+            # FIXED LINE: Combined name and trophies into one bolded code block to prevent markdown errors
+            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} **`{format_name_strict(p['name'])}|{p['trophies']:>4}`** {TROPHY_EMOJI}"
             desc += line + p['delta'] + "\n"
         embed = discord.Embed(title="Server Leaderboard", description=desc, color=discord.Color.gold())
         embed.set_footer(text=f"Page {(i//20)+1}/{(len(data_list)+19)//20}")
