@@ -56,7 +56,7 @@ LEAGUE_EMOJIS = {
     "Titan League 25": "<:titan_league_25:1485298109981397163>", "Titan League 26": "<:titan_league_26:1485298115006300291>", "Titan League 27": "<:titan_league_27:1485298118416269425>",
     "Dragon League 28": "<:dragon_league_28:1485298122505846958>", "Dragon League 29": "<:dragon_league_29:1485298126935031958>", "Dragon League 30": "<:dragon_league_30:1485298131863077104>",
     "Electro League 31": "<:electro_league_31:1485298134958735360>", "Electro League 32": "<:electro_league_32:1485298138066714794>", "Electro League 33": "<:electro_league_33:1485298142776918126>",
-    "Legend League 3": "<:legend_3:1499823876601942216>",  # FIX: Update this ID to your actual Legend 3 emoji ID
+    "Legend League 3": "<:legend_3:1499823876601942216>",  
     "Legend League 2": "<:legend_2:1499822746924748881>",
     "Legend League 1": "<:legend_1:1499819879296139374>"
 }
@@ -97,7 +97,8 @@ async def player_autocomplete(interaction: discord.Interaction, current: str) ->
 # --- FORMATTING HELPERS ---
 def format_name_strict(name, max_width=16):
     if name and name.lower() == "sam": return "/Sam\\".ljust(max_width)
-    safe_name = name.replace('`', "'")
+    safe_name = "".join(c for c in name if c.isascii()).replace('`', "'").strip()
+    if not safe_name: safe_name = "Unknown"
     return (safe_name[:max_width - 2] + "..").ljust(max_width) if len(safe_name) > max_width else safe_name.ljust(max_width)
 
 def to_superscript(num):
@@ -115,7 +116,7 @@ def is_admin_or_owner():
         return interaction.user.id == OWNER_ID or interaction.user.guild_permissions.administrator
     return app_commands.check(predicate)
 
-# --- API CORE ---
+# --- API CORE & POLLING ---
 async def safe_fetch(session, url, headers, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -126,43 +127,96 @@ async def safe_fetch(session, url, headers, max_retries=3):
         except: await asyncio.sleep(1)
     return None, None
 
-async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, semaphore=None):
+async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, name_cache, semaphore=None):
     async with (semaphore or contextlib.nullcontext()):
         status, d = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}", headers)
         if status == 200 and d:
             current_trophies = d.get('trophies', 0)
-            
-            # API dynamically resolves the tier
             l_name = TIER_ID_TO_NAME.get(d.get('leagueTier', {}).get('id'), "Unranked")
             weight = LEAGUE_WEIGHTS.get(l_name, 0)
             legend_log = None
 
-            if weight >= 34:
-                log_status, log_data = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog", headers)
-                if log_status == 200 and log_data:
-                    p_stats = legend_stats_cache.setdefault(tag, {"seen_battles": [], "initialized": False, "off_count": 0, "off_trophies": 0, "def_count": 0, "def_trophies": 0, "last_reset": None})
-                    now_str = (datetime.datetime.now(datetime.timezone.utc).date() if datetime.datetime.now(datetime.timezone.utc).hour >= 5 else (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).date()).isoformat()
+            log_status, log_data = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}/battlelog", headers)
+            if log_status == 200 and log_data:
+                p_stats = legend_stats_cache.setdefault(tag, {
+                    "seen_battles": [], 
+                    "ranked_history": [], 
+                    "initialized": False,
+                    "off_count": 0, "off_trophies": 0, "def_count": 0, "def_trophies": 0, "last_reset": None
+                })
+                
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                ranked_battles = [b for b in log_data.get('items', []) if b.get('battleType', '').lower() == 'ranked']
+                
+                if not p_stats.get("initialized"):
+                    p_stats["seen_battles"] = [f"{b.get('opponentPlayerTag', '')}_{b.get('attack', True)}_{b.get('stars', 0)}_{b.get('destructionPercentage', 0)}_{b.get('trophies', 0)}" for b in ranked_battles]
+                    p_stats["initialized"] = True
+                    p_stats.setdefault("ranked_history", [])
+                else:
+                    seen_set = set(p_stats["seen_battles"])
+                    for b in reversed(ranked_battles):
+                        sig = f"{b.get('opponentPlayerTag', '')}_{b.get('attack', True)}_{b.get('stars', 0)}_{b.get('destructionPercentage', 0)}_{b.get('trophies', 0)}"
+                        if sig not in seen_set:
+                            trop = b.get('trophies', calc_legend_trophies(b.get('stars', 0), b.get('destructionPercentage', 0)))
+                            
+                            opp_tag = b.get('opponentPlayerTag', '').lstrip('#').upper()
+                            opp_name = b.get('opponent', {}).get('name')
+                            
+                            if not opp_name and opp_tag:
+                                if opp_tag in name_cache:
+                                    opp_name = name_cache[opp_tag]
+                                else:
+                                    o_status, o_data = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{opp_tag}", headers)
+                                    if o_status == 200 and o_data and 'name' in o_data:
+                                        opp_name = o_data['name']
+                                        name_cache[opp_tag] = opp_name
+                                        
+                            opp_name = opp_name or (f"#{opp_tag}" if opp_tag else 'Unknown')
 
-                    if p_stats.get("last_reset") != now_str:
-                        p_stats.update({"off_count": 0, "off_trophies": 0, "def_count": 0, "def_trophies": 0, "last_reset": now_str})
+                            p_stats.setdefault("ranked_history", []).append({
+                                "time": now_utc.isoformat(),
+                                "attack": b.get('attack', True),
+                                "stars": b.get('stars', 0),
+                                "dest": b.get('destructionPercentage', 0),
+                                "trophies": trop,
+                                "opp_name": opp_name
+                            })
+                            p_stats["seen_battles"].append(sig)
+                    
+                    p_stats["seen_battles"] = p_stats["seen_battles"][-100:]
+                    eight_days_ago = now_utc - datetime.timedelta(days=8)
+                    p_stats["ranked_history"] = [h for h in p_stats.get("ranked_history", []) if datetime.datetime.fromisoformat(h["time"]) >= eight_days_ago]
 
-                    legend_battles = [b for b in log_data.get('items', []) if b.get('battleType') == 'legend']
-                    if not p_stats["initialized"]:
-                        p_stats.update({"seen_battles": [f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}" for b in legend_battles], "initialized": True})
-                    else:
-                        seen_set = set(p_stats["seen_battles"])
-                        for b in reversed(legend_battles):
-                            sig = f"{b.get('opponentPlayerTag')}_{b.get('attack')}_{b.get('stars')}_{b.get('destructionPercentage')}"
-                            if sig not in seen_set:
-                                trop = calc_legend_trophies(b.get('stars', 0), b.get('destructionPercentage', 0))
-                                if b.get('attack') and p_stats["off_count"] < 8:
-                                    p_stats["off_trophies"] += trop; p_stats["off_count"] += 1
-                                elif not b.get('attack') and p_stats["def_count"] < 8:
-                                    p_stats["def_trophies"] += (0 if b.get('stars') == 0 else trop); p_stats["def_count"] += 1
-                                p_stats["seen_battles"].append(sig)
-                        p_stats["seen_battles"] = p_stats["seen_battles"][-100:]
+                if l_name == "Legend League 1":
+                    if now_utc.hour < 5: reset_time = (now_utc - datetime.timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
+                    else: reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0)
+                else:
+                    days_since_tuesday = (now_utc.weekday() - 1) % 7
+                    reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_since_tuesday)
+                    if now_utc.weekday() == 1 and now_utc.hour < 5: reset_time -= datetime.timedelta(days=7)
+                
+                p_stats["last_reset"] = reset_time.isoformat()
+                p_stats["off_count"] = sum(1 for h in p_stats.get("ranked_history", []) if h["attack"] and datetime.datetime.fromisoformat(h["time"]) >= reset_time)
+                p_stats["off_trophies"] = sum(h["trophies"] for h in p_stats.get("ranked_history", []) if h["attack"] and datetime.datetime.fromisoformat(h["time"]) >= reset_time)
+                
+                p_stats["def_count"] = sum(1 for h in p_stats.get("ranked_history", []) if not h["attack"] and datetime.datetime.fromisoformat(h["time"]) >= reset_time)
+                
+                # Defense Trophies Calculation based on League
+                def_trophies = 0
+                for h in p_stats.get("ranked_history", []):
+                    if not h["attack"] and datetime.datetime.fromisoformat(h["time"]) >= reset_time:
+                        x = h["trophies"]
+                        if l_name == "Legend League 1":
+                            def_trophies -= x
+                        else:
+                            def_trophies += (40 - x)
+                p_stats["def_trophies"] = def_trophies
+
+                if weight >= 34:
                     legend_log = {k: p_stats[k] for k in ['off_count', 'off_trophies', 'def_count', 'def_trophies']}
-                elif log_status == 403: legend_log = "private"
+                    
+            elif log_status == 403: 
+                legend_log = "private"
 
             return {
                 'name': discord.utils.escape_markdown(d.get('name', 'Unknown')), 'trophies': current_trophies,
@@ -193,10 +247,8 @@ class GiveawayView(discord.ui.View):
         gw_data[msg_id_str]["entrants"] = entrants
         await save_json_file(GIVEAWAY_FILE, gw_data)
 
-        # --- UPDATE EMBED WITH PARTICIPANT COUNT ---
         if interaction.message.embeds:
             embed = interaction.message.embeds[0]
-            # Find and update the Participants field
             found = False
             for i, field in enumerate(embed.fields):
                 if field.name == "Participants":
@@ -218,7 +270,7 @@ async def build_leaderboard_embeds(bot):
     t_cache, l_cache, n_cache = await asyncio.gather(load_json_file(TROPHY_CACHE_FILE, {}), load_json_file(LEGEND_STATS_FILE, {}), load_json_file(NAME_CACHE_FILE, {}))
     new_cache, data_list, clans, sem = {}, [], set(), asyncio.Semaphore(3)
 
-    results = await asyncio.gather(*(fetch_player_data(bot.session, tag, COC_HEADERS, t_cache, l_cache, sem) for tag in players))
+    results = await asyncio.gather(*(fetch_player_data(bot.session, tag, COC_HEADERS, t_cache, l_cache, n_cache, sem) for tag in players))
     for p, tag, trop, raw in results:
         if p:
             data_list.append(p); new_cache[tag] = trop
@@ -232,8 +284,7 @@ async def build_leaderboard_embeds(bot):
     for i in range(0, max(1, len(data_list)), 20):
         desc = ""
         for j, p in enumerate(data_list[i:i + 20], start=i + 1):
-            # FIXED LINE: Combined name and trophies into one bolded code block to prevent markdown errors
-            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} **`{format_name_strict(p['name'])}|{p['trophies']:>4}`** {TROPHY_EMOJI}"
+            line = f"**`{f'{j}.'.ljust(3)}`**{p['emoji']} **`{format_name_strict(p['name'])} {p['trophies']:>4}`** {TROPHY_EMOJI}"
             desc += line + p['delta'] + "\n"
         embed = discord.Embed(title="Server Leaderboard", description=desc, color=discord.Color.gold())
         embed.set_footer(text=f"Page {(i//20)+1}/{(len(data_list)+19)//20}")
@@ -513,6 +564,7 @@ async def command_help(interaction: discord.Interaction):
         "**`/leaderboard`** - Manually fetch the current server leaderboard.\n"
         "**`/profile [player]`** - Look up a specific CoC player profile.\n"
         "**`/superwhoo [player]`** - View the Superwhoo Leaderboard or a specific player's painful misses.\n"
+        "**`/battle_log [player]`** - View the ranked battle log based on the player's current league tier.\n"
     )
 
     admin_cmds = (
@@ -760,7 +812,8 @@ async def player_profile(interaction: discord.Interaction, player: str):
     if not (target_tag := await resolve_player_input(player)): return await interaction.followup.send("❌ Please provide a valid player name or tag.")
 
     legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
-    p_dict, _, _, raw = await fetch_player_data(bot.session, target_tag, COC_HEADERS, {}, legend_stats_cache)
+    name_cache = await load_json_file(NAME_CACHE_FILE, {})
+    p_dict, _, _, raw = await fetch_player_data(bot.session, target_tag, COC_HEADERS, {}, legend_stats_cache, name_cache)
     await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
 
     if raw:
@@ -769,7 +822,7 @@ async def player_profile(interaction: discord.Interaction, player: str):
         embed = discord.Embed(title=f"{p_dict['emoji']} {formatted_profile_name} (TH{p_dict['th']})", url=f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={target_tag}", color=discord.Color.blue())
         embed.add_field(name="Clan", value=f"{raw.get('clan', {}).get('name', 'No Clan')} ({raw.get('role', 'Member').capitalize() if raw.get('clan') else 'N/A'})", inline=False)
         embed.add_field(name="Trophies", value=f"{TROPHY_EMOJI} {raw.get('trophies')} (Best: {raw.get('bestTrophies')})", inline=True)
-        embed.add_field(name="War Stars", value=f"⭐ {raw.get('warStars')}", inline=True)
+        embed.add_field(name="War Stars", value=f" ★ {raw.get('warStars')}", inline=True)
         embed.add_field(name="Attacks Won", value=f"⚔️ {raw.get('attackWins')}", inline=True)
         embed.add_field(name="Superwhoo Fails", value=f"💔 {sw_count}", inline=True)
         embed.set_footer(text=f"Tag: #{target_tag}")
@@ -817,6 +870,169 @@ async def command_superwhoo(interaction: discord.Interaction, player: str = None
     desc_text = "".join(f"{'🥇' if i==1 else '🥈' if i==2 else '🥉' if i==3 else f'`{i}.`'} **{discord.utils.escape_markdown('/Sam\\' if p['name'].lower() == 'sam' else p['name'])}** - {p['count']} Superwhoo{'s' if p['count'] != 1 else ''}\n" for i, p in enumerate(lb[:50], 1))
     embed = discord.Embed(title="🏆 The Superwhoo Leaderboard 🏆", description="The ultimate wall of shame for 97-99% war attacks (Normal & CWL).", color=discord.Color.red())
     embed.add_field(name="Rankings", value=desc_text, inline=False)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name='battle_log', description="View the ranked battle log split into Offense and Defense.")
+@app_commands.autocomplete(player=player_autocomplete)
+async def command_battle_log(interaction: discord.Interaction, player: str):
+    await interaction.response.defer()
+    if not (target_tag := await resolve_player_input(player)):
+        return await interaction.followup.send("❌ Please provide a valid player name or tag.")
+
+    status, d = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/players/%23{target_tag}", COC_HEADERS)
+    if status != 200 or not d:
+        return await interaction.followup.send("❌ Could not find that player, or the API is currently unavailable.")
+
+    l_name = TIER_ID_TO_NAME.get(d.get('leagueTier', {}).get('id'), "Unranked")
+    
+    limit = 15
+    if "Skeleton" in l_name or "Barbarian" in l_name: limit = 6
+    elif "Archer" in l_name or "Wizard" in l_name: limit = 8
+    elif "Valkyrie" in l_name or "Witch" in l_name: limit = 10
+    elif "Golem" in l_name or "P.E.K.K.A" in l_name or "Titan" in l_name: limit = 12
+    elif "Dragon" in l_name: limit = 14
+    elif "Electro" in l_name: limit = 18
+    elif "Legend League 3" in l_name: limit = 24
+    elif "Legend League 2" in l_name: limit = 30
+    elif "Legend League 1" in l_name: limit = 8
+        
+    legend_stats_cache = await load_json_file(LEGEND_STATS_FILE, {})
+    name_cache = await load_json_file(NAME_CACHE_FILE, {})
+    p_stats = legend_stats_cache.get(target_tag, {})
+
+    if not p_stats or not p_stats.get("ranked_history"):
+        return await interaction.followup.send(f"📉 The API does not provide times for attacks, so the bot must record them live. **{d.get('name', 'Unknown')}** either hasn't attacked yet, or needs to be added to the server tracker first using `/add`.")
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    if l_name == "Legend League 1":
+        if now_utc.hour < 5:
+            reset_time = (now_utc - datetime.timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
+        else:
+            reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0)
+    else:
+        days_since_tuesday = (now_utc.weekday() - 1) % 7
+        reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_since_tuesday)
+        if now_utc.weekday() == 1 and now_utc.hour < 5:
+            reset_time -= datetime.timedelta(days=7)
+
+    valid_logs = []
+    updated_history = False
+    
+    for h in p_stats.get("ranked_history", []):
+        dt = datetime.datetime.fromisoformat(h["time"])
+        if dt >= reset_time:
+            # Retroactively fetch names for old tags to fix previously saved data
+            if h.get('opp_name', '').startswith('#'):
+                o_tag = h['opp_name'].lstrip('#')
+                if o_tag in name_cache:
+                    h['opp_name'] = name_cache[o_tag]
+                    updated_history = True
+                else:
+                    o_status, o_data = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/players/%23{o_tag}", COC_HEADERS)
+                    if o_status == 200 and o_data and 'name' in o_data:
+                        h['opp_name'] = o_data['name']
+                        name_cache[o_tag] = o_data['name']
+                        updated_history = True
+            valid_logs.append((h, dt))
+            
+    if updated_history:
+        await save_json_file(NAME_CACHE_FILE, name_cache)
+        await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
+            
+    if not valid_logs:
+        reset_timestamp_display = f"<t:{int(reset_time.timestamp())}:R>"
+        return await interaction.followup.send(f"📉 No ranked battles found in the internal bot logs for **{d.get('name', 'Unknown')}** since the last reset ({reset_timestamp_display}).")
+        
+    offense_logs = [(h, dt) for h, dt in valid_logs if h.get('attack', True)]
+    defense_logs = [(h, dt) for h, dt in valid_logs if not h.get('attack', True)]
+
+    offense_logs.sort(key=lambda x: x[1], reverse=True)
+    defense_logs.sort(key=lambda x: x[1], reverse=True)
+
+    offense_to_show = offense_logs[:limit]
+    defense_to_show = defense_logs[:limit]
+    
+    # Calculate Averages & Totals
+    def get_averages_and_totals(logs):
+        if not logs: return 0.0, 0.0, 0
+        total_stars = sum(h.get('stars', 0) for h, _ in logs)
+        total_dest = sum(h.get('dest', 0) for h, _ in logs)
+        
+        total_trop = 0
+        for h, _ in logs:
+            x = h.get('trophies', calc_legend_trophies(h.get('stars', 0), h.get('dest', 0)))
+            if h.get('attack', True):
+                total_trop += x
+            elif l_name == "Legend League 1":
+                total_trop -= x
+            else:
+                total_trop += (40 - x)
+                
+        return total_stars / len(logs), total_dest / len(logs), total_trop
+
+    off_avg_stars, off_avg_dest, total_off_trop = get_averages_and_totals(offense_to_show)
+    def_avg_stars, def_avg_dest, total_def_trop = get_averages_and_totals(defense_to_show)
+
+    off_avg_text = f"{off_avg_stars:.2f}  ★ | {off_avg_dest:.1f}% 💥" if offense_to_show else "N/A"
+    def_avg_text = f"{def_avg_stars:.2f}  ★ | {def_avg_dest:.1f}% 💥" if defense_to_show else "N/A"
+    
+    embed = discord.Embed(title=f"Ranked Battle Log for {d.get('name', 'Unknown')}", color=discord.Color.brand_red())
+    embed.description = (
+        f"**League:** {LEAGUE_EMOJIS.get(l_name, '➖')} {l_name}\n"
+        f"**Since Last Reset:** <t:{int(reset_time.timestamp())}:R>\n"
+        f"**Offense Avg:** {off_avg_text}\n"
+        f"**Defense Avg:** {def_avg_text}\n\u200b"
+    )
+    
+    def build_column_text(logs, is_offense):
+        if not logs:
+            return "`No logs yet.`"
+        
+        text = ""
+        for h, dt in logs:
+            stars = h.get('stars', 0)
+            dest = h.get('dest', 0)
+            x = h.get('trophies', calc_legend_trophies(stars, dest))
+            
+            if is_offense:
+                trop_change = x
+            elif l_name == "Legend League 1":
+                trop_change = -x
+            else:
+                trop_change = 40 - x
+            
+            if trop_change > 0:
+                trop_str = f"+{trop_change}"
+            elif trop_change < 0:
+                trop_str = f"{trop_change}"
+            else:
+                trop_str = "  0"
+                
+            name_col = format_name_strict(h.get('opp_name', 'Unknown'), 12)
+            dest_col = f"{dest:>3}%"
+            star_str = "★" * stars + "☆" * (3 - stars)
+            
+            # Formats cleanly without bolding
+            entry = f"`{name_col} {dest_col} {trop_str:>3}` {star_str}\n"
+            
+            if len(text) + len(entry) > 1000:
+                text += "...(truncated)"
+                break
+                
+            text += entry
+        return text
+
+    offense_text = build_column_text(offense_to_show, is_offense=True)
+    defense_text = build_column_text(defense_to_show, is_offense=False)
+    
+    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit}) | +{total_off_trop} 🏆"
+    def_trop_str = f"+{total_def_trop}" if total_def_trop > 0 else f"{total_def_trop}" if total_def_trop < 0 else "0"
+    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit}) | {def_trop_str} 🏆"
+
+    embed.add_field(name=off_title, value=offense_text, inline=True)
+    embed.add_field(name=def_title, value=defense_text, inline=True)
+    
     await interaction.followup.send(embed=embed)
 
 
