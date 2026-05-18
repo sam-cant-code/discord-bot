@@ -124,7 +124,9 @@ async def safe_fetch(session, url, headers, max_retries=3):
                 if r.status == 429:
                     await asyncio.sleep(2 ** attempt); continue
                 return r.status, (await r.json() if r.status == 200 else None)
-        except: await asyncio.sleep(1)
+        except Exception as e: 
+            logger.error(f"Fetch Error URL ({url}): {e}")
+            await asyncio.sleep(1)
     return None, None
 
 async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_cache, name_cache, semaphore=None):
@@ -987,7 +989,7 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     
     def build_column_text(logs, is_offense):
         if not logs:
-            return "`No logs yet.`"
+            return "```ansi\n\u001b[0mNo logs yet.\u001b[0m\n```"
         
         text = ""
         for h, dt in logs:
@@ -1013,15 +1015,24 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
             dest_col = f"{dest:>3}%"
             star_str = "★" * stars + "☆" * (3 - stars)
             
-            # Formats cleanly without bolding
-            entry = f"`{name_col} {dest_col} {trop_str:>3}` {star_str}\n"
+            # Format: {ansi_code}{original_entry}\u001b[0m
+            if is_offense and dest == 100:
+                ansi_code = "\u001b[1;33m"
+            elif not is_offense and dest == 100:
+                ansi_code = "\u001b[1;31m"
+            else:
+                ansi_code = "\u001b[0m"
+                
+            entry = f"{ansi_code}{name_col} {dest_col} {star_str} {trop_str:>3}\u001b[0m\n"
             
-            if len(text) + len(entry) > 1000:
-                text += "...(truncated)"
+            # Ensuring it doesn't cross Discord's embed field length limit (1024)
+            if len(text) + len(entry) > 950:
+                text += "\u001b[0m...(truncated)\u001b[0m\n"
                 break
                 
             text += entry
-        return text
+            
+        return f"```ansi\n{text}```"
 
     offense_text = build_column_text(offense_to_show, is_offense=True)
     defense_text = build_column_text(defense_to_show, is_offense=False)
