@@ -13,12 +13,14 @@ PLAYERS_FILE, CONFIG_FILE, TROPHY_CACHE_FILE = 'players.json', 'lb_config.json',
 LEGEND_STATS_FILE, SUPERWHOO_FILE = 'legend_stats.json', 'superwhoo_stats.json'
 NAME_CACHE_FILE = 'name_cache.json'
 GIVEAWAY_FILE = 'giveaways.json'
+CLAN_INFO_FILE = 'clan_info_config.json'  # Added for auto-refreshing clan info
 
 # --- AUTOMATIC FILE CREATOR ---
 def ensure_files_exist():
     files_with_defaults = {
         PLAYERS_FILE: [],
         CONFIG_FILE: {},
+        CLAN_INFO_FILE: {},
         TROPHY_CACHE_FILE: {},
         LEGEND_STATS_FILE: {},
         SUPERWHOO_FILE: {},
@@ -42,6 +44,10 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 TROPHY_EMOJI = "<:Trophy:1485318298445938740>"
+TH_EMOJIS = {
+    18: "<:Town_Hall18:1504882116163272724>",
+    17: "<:Town_Hall17:1505937976742510773>"
+}
 
 # --- EMOJI & LEAGUE MAPPERS ---
 LEAGUE_EMOJIS = {
@@ -59,6 +65,29 @@ LEAGUE_EMOJIS = {
     "Legend League 3": "<:legend_3:1499823876601942216>",  
     "Legend League 2": "<:legend_2:1499822746924748881>",
     "Legend League 1": "<:legend_1:1499819879296139374>"
+}
+
+CWL_EMOJIS = {
+    "Champion League I": "🏆",
+    "Champion League II": "🏆",
+    "Champion League III": "<:Icon_HV_CWL_Champion_3:1506303148946362538>",
+    "Master League I": "<:Icon_HV_CWL_Master_1:1506303122019057725>",
+    "Master League II": "<:Icon_HV_CWL_Master_2:1506303088074686605>",
+    "Master League III": "<:Master_3:1506303043837362308>",
+    "Crystal League I": "🏆",
+    "Crystal League II": "🏆",
+    "Crystal League III": "🏆",
+    "Gold League I": "🏆",
+    "Gold League II": "🏆",
+    "Gold League III": "🏆",
+    "Silver League I": "🏆",
+    "Silver League II": "🏆",
+    "Silver League III": "🏆",
+    "Bronze League I": "🏆",
+    "Bronze League II": "🏆",
+    "Bronze League III": "🏆",
+    "Unranked": "➖",
+    "N/A": "❔"
 }
 
 LEAGUE_WEIGHTS = {name: i for i, name in enumerate(LEAGUE_EMOJIS.keys(), start=1)}
@@ -294,6 +323,72 @@ async def build_leaderboard_embeds(bot):
     return embeds, clans, players
 
 
+async def build_clan_info_embeds(session):
+    alliance_clans = [
+        {
+            "tag": "#2QUVQR0LC",
+            "type": "👑Competitive clan",
+            "requirements": "TH17+, cwl trials",
+            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2QUVQR0LC",
+            "image_filename": "angrybirdsbanner.jpeg",
+            "color": discord.Color.red()
+        },
+        {
+            "tag": "#2GCCRP2JY",
+            "type": "⚔️CWL Feeder clan",
+            "requirements": "None",
+            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2GCCRP2JY",
+            "image_filename": "nightbirdsbanner.jpeg",
+            "color": discord.Color.purple()
+        },
+        {
+            "tag": "#2RYPQ0GRQ",
+            "type": "💎Ore wars/sidewars clan",
+            "requirements": "None",
+            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2RYPQ0GRQ",
+            "image_filename": "elitesyndicatebanner.jpeg",
+            "color": discord.Color.blue()
+        }
+    ]
+
+    embeds_to_send = []
+    files_to_send = []
+
+    for clan in alliance_clans:
+        clean_tag = clan['tag'].replace('#', '%23')
+        status, clan_data = await safe_fetch(session, f"https://api.clashofclans.com/v1/clans/{clean_tag}", COC_HEADERS)
+
+        wins = clan_data.get('warWins', 0) if status == 200 else "N/A"
+        streak = clan_data.get('warWinStreak', 0) if status == 200 else "N/A"
+        league = clan_data.get('warLeague', {}).get('name', 'Unranked') if status == 200 else "N/A"
+        cwl_emoji = CWL_EMOJIS.get(league, "🏆")
+
+        text_embed = discord.Embed(
+            description=(
+                f"**Type:** {clan['type']}\n"
+                f"**Requirements:** {clan['requirements']}\n"
+                f"**Clan League:** {cwl_emoji} {league}\n"
+                f"**War Wins:** {wins}\n"
+                f"**Win Streak:** 🔥 {streak}\n"
+                f"[🔗 View in Game]({clan['link']}) • `{clan['tag']}`"
+            ),
+            color=clan['color']
+        )
+
+        try:
+            file = discord.File(clan['image_filename'], filename=clan['image_filename'])
+            files_to_send.append(file)
+            img_embed = discord.Embed(color=clan['color'])
+            img_embed.set_image(url=f"attachment://{clan['image_filename']}")
+            embeds_to_send.append(img_embed)
+            embeds_to_send.append(text_embed)
+        except FileNotFoundError:
+            text_embed.description = f"*(Error: Could not find image file `{clan['image_filename']}`)*\n\n" + text_embed.description
+            embeds_to_send.append(text_embed)
+
+    return embeds_to_send, files_to_send
+
+
 class LeaderboardView(discord.ui.View):
     def __init__(self, bot, embeds=None, page=0, msg_id=None):
         super().__init__(timeout=None)
@@ -473,6 +568,7 @@ class CoCBot(commands.Bot):
 
         await self.tree.sync()
         auto_lb.start()
+        auto_clan_info.start()
         giveaway_checker.start()
 
     async def close(self):
@@ -491,6 +587,20 @@ async def auto_lb():
             msg = await chan.fetch_message(config["message_id"])
             await msg.edit(embed=embeds[0], view=LeaderboardView(bot, embeds))
     except: pass
+
+
+@tasks.loop(minutes=15)
+async def auto_clan_info():
+    try:
+        config = await load_json_file(CLAN_INFO_FILE, {})
+        if config.get("channel_id") and config.get("message_id"):
+            if (chan := bot.get_channel(config["channel_id"])):
+                msg = await chan.fetch_message(config["message_id"])
+                embeds, files = await build_clan_info_embeds(bot.session)
+                # Replacing embeds and attachments to keep imagery intact
+                await msg.edit(embeds=embeds, attachments=files)
+    except Exception as e:
+        logger.error(f"Auto Clan Info update failed: {e}")
 
 
 @tasks.loop(minutes=1)
@@ -575,6 +685,7 @@ async def command_help(interaction: discord.Interaction):
         "**`/setup_tickets`** - Set up the ticket application panel. (WIP)\n"
         "**`/setup_self_roles`** - Set up the self-assignable roles message.\n"
         "**`/set_leaderboard`** - Set up the automated updating leaderboard.\n"
+        "**`/set_clan_info`** - Set up the automated updating clan info panel.\n"
         "**`/say`** - Make the bot say a message in a specific channel.\n"
         "**`/add [tag]`** - Add a player to the tracker.\n"
         "**`/add_clan [tag]`** - Add all members of a clan to the tracker.\n"
@@ -634,9 +745,9 @@ async def setup_tickets(interaction: discord.Interaction):
     embed = discord.Embed(
         title="The Bird Nest Clans",
         description="**Select which clan you would like to apply to**\n\n"
-                    "🦅 - Angry Birds\n"
-                    "🦉 - Night Birds\n"
-                    "🛡️ - Elite Syndicate\n",
+            "🦅 - Angry Birds\n"
+            "🦉 - Night Birds\n"
+            "🛡️ - Elite Syndicate\n",
         color=discord.Color.brand_green()
     )
     embed.set_footer(text="Application System")
@@ -644,71 +755,29 @@ async def setup_tickets(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Ticket panel deployed!", ephemeral=True)
 
 
+@bot.tree.command(name='set_clan_info', description="Set up the automated updating clan info leaderboard.")
+@is_admin_or_owner()
+async def set_clan_info(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    config = await load_json_file(CLAN_INFO_FILE, {})
+    
+    if config.get("channel_id") and config.get("message_id") and (old_channel := bot.get_channel(config["channel_id"])):
+        try: 
+            await (await old_channel.fetch_message(config["message_id"])).delete()
+        except: 
+            pass
+
+    embeds, files = await build_clan_info_embeds(bot.session)
+    msg = await interaction.channel.send(embeds=embeds, files=files)
+    
+    await save_json_file(CLAN_INFO_FILE, {"channel_id": interaction.channel_id, "message_id": msg.id})
+    await interaction.followup.send("✅ Automated clan info successfully set up in this channel!", ephemeral=True)
+
+
 @bot.tree.command(name='clan_info', description="Displays the clans in our alliance along with their links, types, and stats.")
 async def command_clan_info(interaction: discord.Interaction):
     await interaction.response.defer()
-
-    alliance_clans = [
-        {
-            "tag": "#2QUVQR0LC",
-            "type": "Competitive clan",
-            "requirements": "TH16+, Active Daily",
-            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2QUVQR0LC",
-            "image_filename": "angrybirdsbanner.jpeg",
-            "color": discord.Color.red()
-        },
-        {
-            "tag": "#2GCCRP2JY",
-            "type": "CWL Feeder clan",
-            "requirements": "TH14+",
-            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2GCCRP2JY",
-            "image_filename": "nightbirdsbanner.jpeg",
-            "color": discord.Color.purple()
-        },
-        {
-            "tag": "#2RYPQ0GRQ",
-            "type": "Ore wars/sidewars clan",
-            "requirements": "Heroes down allowed",
-            "link": "https://link.clashofclans.com/en?action=OpenClanProfile&tag=2RYPQ0GRQ",
-            "image_filename": "elitesyndicatebanner.jpeg",
-            "color": discord.Color.blue()
-        }
-    ]
-
-    embeds_to_send = []
-    files_to_send = []
-
-    for clan in alliance_clans:
-        clean_tag = clan['tag'].replace('#', '%23')
-        status, clan_data = await safe_fetch(bot.session, f"https://api.clashofclans.com/v1/clans/{clean_tag}", COC_HEADERS)
-
-        wins = clan_data.get('warWins', 0) if status == 200 else "N/A"
-        streak = clan_data.get('warWinStreak', 0) if status == 200 else "N/A"
-        league = clan_data.get('warLeague', {}).get('name', 'Unranked') if status == 200 else "N/A"
-
-        text_embed = discord.Embed(
-            description=(
-                f"**Type:** {clan['type']}\n"
-                f"**Requirements:** {clan['requirements']}\n"
-                f"**Clan League:** {league}\n"
-                f"**War Wins:** {wins}\n"
-                f"**Win Streak:** 🔥 {streak}\n"
-                f"[🔗 View in Game]({clan['link']})"
-            ),
-            color=clan['color']
-        )
-
-        try:
-            file = discord.File(clan['image_filename'], filename=clan['image_filename'])
-            files_to_send.append(file)
-            img_embed = discord.Embed(color=clan['color'])
-            img_embed.set_image(url=f"attachment://{clan['image_filename']}")
-            embeds_to_send.append(img_embed)
-            embeds_to_send.append(text_embed)
-        except FileNotFoundError:
-            text_embed.description = f"*(Error: Could not find image file `{clan['image_filename']}`)*\n\n" + text_embed.description
-            embeds_to_send.append(text_embed)
-
+    embeds_to_send, files_to_send = await build_clan_info_embeds(bot.session)
     await interaction.followup.send(embeds=embeds_to_send, files=files_to_send)
 
 
@@ -907,16 +976,24 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
         return await interaction.followup.send(f"📉 The API does not provide times for attacks, so the bot must record them live. **{d.get('name', 'Unknown')}** either hasn't attacked yet, or needs to be added to the server tracker first using `/add`.")
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
+    
     if l_name == "Legend League 1":
         if now_utc.hour < 5:
             reset_time = (now_utc - datetime.timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
         else:
             reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0)
+        end_time = reset_time + datetime.timedelta(days=1)
     else:
         days_since_tuesday = (now_utc.weekday() - 1) % 7
         reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_since_tuesday)
         if now_utc.weekday() == 1 and now_utc.hour < 5:
             reset_time -= datetime.timedelta(days=7)
+        # Ends on Monday 5am UTC (6 days after Tuesday)
+        end_time = reset_time + datetime.timedelta(days=6)
+
+    start_str = reset_time.strftime('%d %b').lstrip('0')
+    end_str = end_time.strftime('%d %b').lstrip('0')
+    duration_str = f"{start_str} – {end_str}"
 
     valid_logs = []
     updated_history = False
@@ -943,8 +1020,7 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
         await save_json_file(LEGEND_STATS_FILE, legend_stats_cache)
             
     if not valid_logs:
-        reset_timestamp_display = f"<t:{int(reset_time.timestamp())}:R>"
-        return await interaction.followup.send(f"📉 No ranked battles found in the internal bot logs for **{d.get('name', 'Unknown')}** since the last reset ({reset_timestamp_display}).")
+        return await interaction.followup.send(f"📉 No ranked battles found in the internal bot logs for **{d.get('name', 'Unknown')}** during this period ({duration_str}).")
         
     offense_logs = [(h, dt) for h, dt in valid_logs if h.get('attack', True)]
     defense_logs = [(h, dt) for h, dt in valid_logs if not h.get('attack', True)]
@@ -979,10 +1055,21 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     off_avg_text = f"{off_avg_stars:.2f}  ★ | {off_avg_dest:.1f}% 💥" if offense_to_show else "N/A"
     def_avg_text = f"{def_avg_stars:.2f}  ★ | {def_avg_dest:.1f}% 💥" if defense_to_show else "N/A"
     
-    embed = discord.Embed(title=f"Ranked Battle Log for {d.get('name', 'Unknown')}", color=discord.Color.brand_red())
+    current_trophies = d.get('trophies', 0)
+    raw_name = d.get('name', 'Unknown')
+    formatted_profile_name = '/Sam\\' if raw_name.lower() == 'sam' else raw_name
+    
+    th_level = d.get('townHallLevel', 1)
+    th_emoji = TH_EMOJIS.get(th_level, "🏘️")
+    
+    embed = discord.Embed(
+        title=f"{formatted_profile_name} (#{target_tag})", 
+        url=f"https://link.clashofclans.com/en?action=OpenPlayerProfile&tag={target_tag}",
+        color=discord.Color.brand_red()
+    )
     embed.description = (
-        f"**League:** {LEAGUE_EMOJIS.get(l_name, '➖')} {l_name}\n"
-        f"**Since Last Reset:** <t:{int(reset_time.timestamp())}:R>\n"
+        f"{th_emoji} **{th_level}** {TROPHY_EMOJI} **{current_trophies}** {LEAGUE_EMOJIS.get(l_name, '➖')} **{l_name}**\n\n"
+        f"**Overview ({duration_str})**\n"
         f"**Offense Avg:** {off_avg_text}\n"
         f"**Defense Avg:** {def_avg_text}\n\u200b"
     )
@@ -1019,7 +1106,7 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
             if is_offense and dest == 100:
                 ansi_code = "\u001b[1;33m"
             elif not is_offense and dest == 100:
-                ansi_code = "\u001b[1;31m"
+                ansi_code = "\u001b[31m"
             else:
                 ansi_code = "\u001b[0m"
                 
@@ -1037,9 +1124,9 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     offense_text = build_column_text(offense_to_show, is_offense=True)
     defense_text = build_column_text(defense_to_show, is_offense=False)
     
-    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit}) | +{total_off_trop} 🏆"
+    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit}) | +{total_off_trop} {TROPHY_EMOJI}"
     def_trop_str = f"+{total_def_trop}" if total_def_trop > 0 else f"{total_def_trop}" if total_def_trop < 0 else "0"
-    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit}) | {def_trop_str} 🏆"
+    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit}) | {def_trop_str} {TROPHY_EMOJI}"
 
     embed.add_field(name=off_title, value=offense_text, inline=True)
     embed.add_field(name=def_title, value=defense_text, inline=True)
