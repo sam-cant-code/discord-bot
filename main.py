@@ -1122,10 +1122,10 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
                 ansi_end = "\u001b[0m"
             else:
                 ansi_start = ""
-                ansi_end = " "
+                ansi_end = ""
                 
             # Final output: exactly 21 characters wide. 
-            entry = f"{ansi_start} {name_col} {dest_col} {star_str} {trop_col} {test} {ansi_end}\n"
+            entry = f"{ansi_start}{name_col} {dest_col} {star_str} {trop_col} {test} {ansi_end}\n"
             
             if len(text) + len(entry) > 950:
                 text += "...\n"
