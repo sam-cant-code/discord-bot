@@ -13,7 +13,7 @@ PLAYERS_FILE, CONFIG_FILE, TROPHY_CACHE_FILE = 'players.json', 'lb_config.json',
 LEGEND_STATS_FILE, SUPERWHOO_FILE = 'legend_stats.json', 'superwhoo_stats.json'
 NAME_CACHE_FILE = 'name_cache.json'
 GIVEAWAY_FILE = 'giveaways.json'
-CLAN_INFO_FILE = 'clan_info_config.json'  # Added for auto-refreshing clan info
+CLAN_INFO_FILE = 'clan_info_config.json'
 
 # --- AUTOMATIC FILE CREATOR ---
 def ensure_files_exist():
@@ -163,7 +163,8 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
         status, d = await safe_fetch(session, f"https://api.clashofclans.com/v1/players/%23{tag}", headers)
         if status == 200 and d:
             current_trophies = d.get('trophies', 0)
-            l_name = TIER_ID_TO_NAME.get(d.get('leagueTier', {}).get('id'), "Unranked")
+            
+            l_name = TIER_ID_TO_NAME.get((d.get('leagueTier') or {}).get('id'), "Unranked")
             weight = LEAGUE_WEIGHTS.get(l_name, 0)
             legend_log = None
 
@@ -177,21 +178,21 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                 })
                 
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
-                ranked_battles = [b for b in log_data.get('items', []) if b.get('battleType', '').lower() == 'ranked']
+                ranked_battles = [b for b in log_data.get('items', []) if (b.get('battleType') or '').lower() == 'ranked']
                 
                 if not p_stats.get("initialized"):
-                    p_stats["seen_battles"] = [f"{b.get('opponentPlayerTag', '')}_{b.get('attack', True)}_{b.get('stars', 0)}_{b.get('destructionPercentage', 0)}_{b.get('trophies', 0)}" for b in ranked_battles]
+                    p_stats["seen_battles"] = [f"{(b.get('opponentPlayerTag') or '')}_{b.get('attack', True)}_{b.get('stars', 0)}_{b.get('destructionPercentage', 0)}_{b.get('trophies', 0)}" for b in ranked_battles]
                     p_stats["initialized"] = True
                     p_stats.setdefault("ranked_history", [])
                 else:
                     seen_set = set(p_stats["seen_battles"])
                     for b in reversed(ranked_battles):
-                        sig = f"{b.get('opponentPlayerTag', '')}_{b.get('attack', True)}_{b.get('stars', 0)}_{b.get('destructionPercentage', 0)}_{b.get('trophies', 0)}"
+                        sig = f"{(b.get('opponentPlayerTag') or '')}_{b.get('attack', True)}_{b.get('stars', 0)}_{b.get('destructionPercentage', 0)}_{b.get('trophies', 0)}"
                         if sig not in seen_set:
                             trop = b.get('trophies', calc_legend_trophies(b.get('stars', 0), b.get('destructionPercentage', 0)))
                             
-                            opp_tag = b.get('opponentPlayerTag', '').lstrip('#').upper()
-                            opp_name = b.get('opponent', {}).get('name')
+                            opp_tag = (b.get('opponentPlayerTag') or '').lstrip('#').upper()
+                            opp_name = (b.get('opponent') or {}).get('name')
                             
                             if not opp_name and opp_tag:
                                 if opp_tag in name_cache:
@@ -232,7 +233,6 @@ async def fetch_player_data(session, tag, headers, trophy_cache, legend_stats_ca
                 
                 p_stats["def_count"] = sum(1 for h in p_stats.get("ranked_history", []) if not h["attack"] and datetime.datetime.fromisoformat(h["time"]) >= reset_time)
                 
-                # Defense Trophies Calculation based on League
                 def_trophies = 0
                 for h in p_stats.get("ranked_history", []):
                     if not h["attack"] and datetime.datetime.fromisoformat(h["time"]) >= reset_time:
@@ -301,8 +301,14 @@ async def build_leaderboard_embeds(bot):
     t_cache, l_cache, n_cache = await asyncio.gather(load_json_file(TROPHY_CACHE_FILE, {}), load_json_file(LEGEND_STATS_FILE, {}), load_json_file(NAME_CACHE_FILE, {}))
     new_cache, data_list, clans, sem = {}, [], set(), asyncio.Semaphore(3)
 
-    results = await asyncio.gather(*(fetch_player_data(bot.session, tag, COC_HEADERS, t_cache, l_cache, n_cache, sem) for tag in players))
-    for p, tag, trop, raw in results:
+    results = await asyncio.gather(*(fetch_player_data(bot.session, tag, COC_HEADERS, t_cache, l_cache, n_cache, sem) for tag in players), return_exceptions=True)
+    
+    for res in results:
+        if isinstance(res, Exception):
+            logger.error(f"Error fetching a player profile: {res}")
+            continue
+            
+        p, tag, trop, raw = res
         if p:
             data_list.append(p); new_cache[tag] = trop
             if raw and raw.get('clan'): clans.add(raw['clan']['tag'])
@@ -518,7 +524,7 @@ class TicketModal(discord.ui.Modal):
 
         role_ping = ""
         if self.clan_name == "Angry Birds":
-            role_ping = ""  # e.g., "<@&123456789012345678>"
+            role_ping = ""
         elif self.clan_name == "Night Birds":
             role_ping = ""
         elif self.clan_name == "Elite Syndicate":
@@ -559,7 +565,6 @@ class CoCBot(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
 
-        # Register Persistent Views so buttons work after restarts
         self.add_view(LeaderboardView(self))
         self.add_view(SelfRoleView())
         self.add_view(TicketLauncherView())
@@ -586,7 +591,8 @@ async def auto_lb():
         if (chan := bot.get_channel(config.get("channel_id"))):
             msg = await chan.fetch_message(config["message_id"])
             await msg.edit(embed=embeds[0], view=LeaderboardView(bot, embeds))
-    except: pass
+    except Exception as e:
+        logger.error(f"Auto LB Loop crashed: {e}")
 
 
 @tasks.loop(minutes=15)
@@ -597,7 +603,6 @@ async def auto_clan_info():
             if (chan := bot.get_channel(config["channel_id"])):
                 msg = await chan.fetch_message(config["message_id"])
                 embeds, files = await build_clan_info_embeds(bot.session)
-                # Replacing embeds and attachments to keep imagery intact
                 await msg.edit(embeds=embeds, attachments=files)
     except Exception as e:
         logger.error(f"Auto Clan Info update failed: {e}")
@@ -630,7 +635,6 @@ async def giveaway_checker():
                 ended_embed = message.embeds[0]
                 ended_embed.color = discord.Color.red()
                 ended_embed.title = "🎊 Giveaway Ended 🎊"
-                # Update Participant count one last time for finality
                 for i, field in enumerate(ended_embed.fields):
                     if field.name == "Participants":
                         ended_embed.set_field_at(i, name="Participants", value=str(len(entrants)), inline=True)
@@ -988,7 +992,6 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
         reset_time = now_utc.replace(hour=5, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_since_tuesday)
         if now_utc.weekday() == 1 and now_utc.hour < 5:
             reset_time -= datetime.timedelta(days=7)
-        # Ends on Monday 5am UTC (6 days after Tuesday)
         end_time = reset_time + datetime.timedelta(days=6)
 
     start_str = reset_time.strftime('%d %b').lstrip('0')
@@ -1001,7 +1004,6 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     for h in p_stats.get("ranked_history", []):
         dt = datetime.datetime.fromisoformat(h["time"])
         if dt >= reset_time:
-            # Retroactively fetch names for old tags to fix previously saved data
             if h.get('opp_name', '').startswith('#'):
                 o_tag = h['opp_name'].lstrip('#')
                 if o_tag in name_cache:
@@ -1032,6 +1034,7 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     defense_to_show = defense_logs[:limit]
     
     # Calculate Averages & Totals
+    # Calculate Averages & Totals
     def get_averages_and_totals(logs):
         if not logs: return 0.0, 0.0, 0
         total_stars = sum(h.get('stars', 0) for h, _ in logs)
@@ -1052,8 +1055,8 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     off_avg_stars, off_avg_dest, total_off_trop = get_averages_and_totals(offense_to_show)
     def_avg_stars, def_avg_dest, total_def_trop = get_averages_and_totals(defense_to_show)
 
-    off_avg_text = f"{off_avg_stars:.2f}  ★ | {off_avg_dest:.1f}% 💥" if offense_to_show else "N/A"
-    def_avg_text = f"{def_avg_stars:.2f}  ★ | {def_avg_dest:.1f}% 💥" if defense_to_show else "N/A"
+    off_avg_text = f"{off_avg_stars:.2f} ★ | {off_avg_dest:.1f}%" if offense_to_show else "N/A"
+    def_avg_text = f"{def_avg_stars:.2f} ★ | {def_avg_dest:.1f}%" if defense_to_show else "N/A"
     
     current_trophies = d.get('trophies', 0)
     raw_name = d.get('name', 'Unknown')
@@ -1070,15 +1073,14 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     embed.description = (
         f"{th_emoji} **{th_level}** {TROPHY_EMOJI} **{current_trophies}** {LEAGUE_EMOJIS.get(l_name, '➖')} **{l_name}**\n\n"
         f"**Overview ({duration_str})**\n"
-        f"**Offense Avg:** {off_avg_text}\n"
-        f"**Defense Avg:** {def_avg_text}\n\u200b"
+        f"**Off:** {off_avg_text} | **Def:** {def_avg_text}\n\u200b"
     )
     
     def build_column_text(logs, is_offense):
         if not logs:
-            return "```ansi\n\u001b[0mNo logs yet.\u001b[0m\n```"
+            return "```ansi\n\u001b[0;30mNo logs yet.\u001b[0m\n```"
         
-        text = ""
+        text = " "
         for h, dt in logs:
             stars = h.get('stars', 0)
             dest = h.get('dest', 0)
@@ -1091,30 +1093,41 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
             else:
                 trop_change = 40 - x
             
-            if trop_change > 0:
-                trop_str = f"+{trop_change}"
-            elif trop_change < 0:
-                trop_str = f"{trop_change}"
-            else:
-                trop_str = "  0"
+            trop_str = f"+{trop_change}" if trop_change > 0 else str(trop_change) if trop_change < 0 else "0"
                 
-            name_col = format_name_strict(h.get('opp_name', 'Unknown'), 12)
-            dest_col = f"{dest:>3}%"
+            # --- EXACT WIDTH FORMATTING ---
+            safe_name = "".join(c for c in h.get('opp_name', 'Unknown') if c.isascii()).replace('`', "'").strip()
+            
+            # Name: Exactly 8 characters, left-aligned
+            name_col = (safe_name[:6] + "..").ljust(8) if len(safe_name) > 8 else safe_name.ljust(8)
+            
+            # Dest: Exactly 4 characters, right-aligned (e.g., '100%', ' 97%')
+            dest_col = f"{dest}%".rjust(4)
+            
+            test=""
+            
+            # Stars: Exactly 3 characters
             star_str = "★" * stars + "☆" * (3 - stars)
             
-            # Format: {ansi_code}{original_entry}\u001b[0m
-            if is_offense and dest == 100:
-                ansi_code = "\u001b[1;33m"
-            elif not is_offense and dest == 100:
-                ansi_code = "\u001b[31m"
-            else:
-                ansi_code = "\u001b[0m"
-                
-            entry = f"{ansi_code}{name_col} {dest_col} {star_str} {trop_str:>3}\u001b[0m\n"
+            # Trophies: Exactly 3 characters, right-aligned (e.g., '+40', '-32', '  0')
+            trop_col = trop_str.rjust(3)
             
-            # Ensuring it doesn't cross Discord's embed field length limit (1024)
+            # --- ANSI COLORS ---
+            if is_offense and dest == 100:
+                ansi_start = "\u001b[1;33m" # Bold Yellow
+                ansi_end = "\u001b[0m"
+            elif not is_offense and dest == 100:
+                ansi_start = "\u001b[1;31m" # Bold Red
+                ansi_end = "\u001b[0m"
+            else:
+                ansi_start = ""
+                ansi_end = " "
+                
+            # Final output: exactly 21 characters wide. 
+            entry = f"{ansi_start} {name_col} {dest_col} {star_str} {trop_col} {test} {ansi_end}\n"
+            
             if len(text) + len(entry) > 950:
-                text += "\u001b[0m...(truncated)\u001b[0m\n"
+                text += "...\n"
                 break
                 
             text += entry
@@ -1124,9 +1137,8 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     offense_text = build_column_text(offense_to_show, is_offense=True)
     defense_text = build_column_text(defense_to_show, is_offense=False)
     
-    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit}) | +{total_off_trop} {TROPHY_EMOJI}"
-    def_trop_str = f"+{total_def_trop}" if total_def_trop > 0 else f"{total_def_trop}" if total_def_trop < 0 else "0"
-    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit}) | {def_trop_str} {TROPHY_EMOJI}"
+    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit})"
+    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit})"
 
     embed.add_field(name=off_title, value=offense_text, inline=True)
     embed.add_field(name=def_title, value=defense_text, inline=True)
