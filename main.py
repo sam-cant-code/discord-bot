@@ -1071,10 +1071,11 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
         color=discord.Color.brand_red()
     )
     embed.description = (
-        f"{th_emoji} **{th_level}** {TROPHY_EMOJI} **{current_trophies}** {LEAGUE_EMOJIS.get(l_name, '➖')} **{l_name}**\n\n"
-        f"**Overview ({duration_str})**\n"
-        f"**Off:** {off_avg_text} | **Def:** {def_avg_text}\n\u200b"
-    )
+    f"{th_emoji} **{th_level}** {TROPHY_EMOJI} **{current_trophies}** {LEAGUE_EMOJIS.get(l_name, '➖')} **{l_name}**\n\n"
+    f"**Overview ({duration_str})**\n"
+    f"⚔️ **Off:** {off_avg_stars:.2f} ★ | {off_avg_dest:.1f}%\n"
+    f"🛡️ **Def:** {def_avg_stars:.2f} ★ | {def_avg_dest:.1f}%\n\u200b"
+)
     
     def build_column_text(logs, is_offense):
         if not logs:
@@ -1137,8 +1138,8 @@ async def command_battle_log(interaction: discord.Interaction, player: str):
     offense_text = build_column_text(offense_to_show, is_offense=True)
     defense_text = build_column_text(defense_to_show, is_offense=False)
     
-    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit})"
-    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit})"
+    off_title = f"⚔️ Offense ({len(offense_to_show)}/{limit}) | +{total_off_trop} {TROPHY_EMOJI}"
+    def_title = f"🛡️ Defense ({len(defense_to_show)}/{limit}) | {total_def_trop:+} {TROPHY_EMOJI}"
 
     embed.add_field(name=off_title, value=offense_text, inline=True)
     embed.add_field(name=def_title, value=defense_text, inline=True)
